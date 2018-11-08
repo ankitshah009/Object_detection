@@ -1050,6 +1050,8 @@ class Mask_RCNN_FPN():
 		#c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),tf.stop_gradient(c5)
 		if config.freeze == 0:
 			c2345 = tf.stop_gradient(c2),c3,c4,c5
+		elif config.freeze == 1:
+			c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),c4,c5
 		elif config.freeze == 2:
 			c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),c5
 		else:
@@ -2090,6 +2092,8 @@ class Mask_RCNN_FPN_Act():
 		#c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),tf.stop_gradient(c5)
 		if config.freeze == 0:
 			c2345 = tf.stop_gradient(c2),c3,c4,c5
+		elif config.freeze == 1:
+			c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),c4,c5
 		elif config.freeze == 2:
 			c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),c5
 		else:
