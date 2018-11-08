@@ -863,8 +863,8 @@ def train_diva(config):
 					average_ap,average_ar = weighted_average(aps,ars,eval_target_weight)
 
 
-					ap_weight = 0.4
-					ar_weight = 0.6
+					ap_weight = 0.5
+					ar_weight = 0.5
 					validation_performance = average_ap*ap_weight + average_ar*ar_weight
 
 					if config.add_act:
@@ -881,8 +881,8 @@ def train_diva(config):
 						ar_weight = 0.1
 						act_validation_performance = average_ap*ap_weight + average_ar*ar_weight
 
-						act_perf_weight = 0.8
-						obj_perf_weight = 0.2
+						act_perf_weight = 0.5
+						obj_perf_weight = 0.5
 						validation_performance = obj_perf_weight*obj_validation_performance + act_perf_weight*act_validation_performance
 
 						tqdm.write("\tval in %s at step %s, Obj AP:%s, AR:%s, obj performance %s"%(num_val_steps,global_step,aps_str,ars_str,obj_validation_performance))
