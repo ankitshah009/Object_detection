@@ -1,6 +1,6 @@
 # coding=utf-8
 import tensorflow as tf
-import math,re
+import math,re,cv2
 from operator import mul
 import numpy as np
 
@@ -12,11 +12,6 @@ VERY_NEGATIVE_NUMBER = -1e30
 def conv_out_size_same(size, stride):
 	return int(math.ceil(float(size) / float(stride)))
 
-# leaky relu, to  avoid dead relu
-# f(x) = 1(x<0)   (ax)+1  (x>=0)
-# in DCGAN is f(x) = max(x or ax)
-def lrelu(x,leak=0.2):
-	return tf.maximum(x,leak*x)
 
 # given regex to get the parameter to do regularization
 def wd_cost(regex,wd,scope):
@@ -620,6 +615,7 @@ def resnet_fpn_backbone(image, num_blocks,resolution_requirement,tf_pad_reverse=
 
 	#print l.get_shape()# (1,64,?,?)
 	c2 = resnet_group(l, 'group0', resnet_bottleneck, 64, num_blocks[0], stride=1,tf_pad_reverse=tf_pad_reverse)
+	# never freeze from here on
 	#print l.get_shape()# (1,256,?,?)
 	c3 = resnet_group(c2, 'group1', resnet_bottleneck, 128, num_blocks[1], stride=2,tf_pad_reverse=tf_pad_reverse)
 	#print l.get_shape()# (1,512,?,?)
@@ -675,4 +671,372 @@ def fpn_model(c2345,num_channel,scope):
 
 		p6 = MaxPooling(p2345[-1], shape=1, stride=2, padding='VALID',scope='maxpool_p6',data_format="NCHW")
 		return p2345+[p6]
+
+
+
+# -------------------------all model function
+def sample_fast_rcnn_targets_plus_act(boxes, gt_boxes, gt_labels, act_single_labels,act_pair_labels, config):
+	# act_single_labels is [N,num_act_class]
+
+	iou = pairwise_iou(boxes,gt_boxes)
+
+	# gt_box directly used as proposal
+	#boxes = tf.concat([boxes,gt_boxes],axis=0)
+	#iou = tf.concat([iou, tf.eye(tf.shape(gt_boxes)[0])],axis=0)
+	# [N+M,M]
+	# gt_box in front, so the act single label can match
+	boxes = tf.concat([gt_boxes,boxes],axis=0)
+	iou = tf.concat([tf.eye(tf.shape(gt_boxes)[0]),iou],axis=0)
+
+	def sample_fg_bg(iou):
+		# [K,M] # [M] is the ground truth
+		# [K] # max iou for each proposal to the ground truth
+		fg_mask = tf.reduce_max(iou,axis=1) >= config.fastrcnn_fg_thres
+		fg_inds = tf.reshape(tf.where(fg_mask),[-1]) # [K_FG] # index of fg_mask true element
+
+		x = tf.where(tf.equal(act_single_labels[:,0],0)) # c==0 will fail
+		
+		act_single_fg_inds = tf.reshape(x,[-1])
+
+		num_act_fg = tf.size(act_single_fg_inds)
+
+		num_fg = tf.minimum(int(config.fastrcnn_batch_per_im * config.fastrcnn_fg_ratio),tf.size(fg_inds))
+		# during train time, each time random sample
+		fg_inds = tf.random_shuffle(fg_inds)[:(num_fg-num_act_fg)]# so the pos box is at least > fg_thres iou
+		fg_inds = tf.concat([fg_inds,act_single_fg_inds],axis=0)
+		num_fg = num_fg+num_act_fg
+
+		bg_inds = tf.reshape(tf.where(tf.logical_not(fg_mask)), [-1])
+		num_bg = tf.minimum(config.fastrcnn_batch_per_im - num_fg,tf.size(bg_inds))
+		bg_inds = tf.random_shuffle(bg_inds)[:num_bg]
+
+		return fg_inds,bg_inds
+
+	# get random pos neg from over some iou thres from [N+M]
+	fg_inds, bg_inds = sample_fg_bg(iou)
+
+	best_iou_ind = tf.argmax(iou, axis=1) #[N+M],# proposal -> gt best matched# so each proposal has the gt's index
+	# [N_FG] -> gt Index, so 0-M-1
+	# each pos proposal box assign to the best gt box
+	# indexes of gt_boxes that matched to fg_box
+	fg_inds_wrt_gt = tf.gather(best_iou_ind, fg_inds) # get the pos's gt box indexes
+
+	all_indices = tf.concat([fg_inds,bg_inds],axis=0)
+
+	# selected proposal boxes
+	ret_boxes = tf.gather(boxes, all_indices, name="sampled_proposal_boxes")
+	# [K] -> [N_FG+N_BG]
+	ret_labels = tf.concat([tf.gather(gt_labels, fg_inds_wrt_gt),tf.zeros_like(bg_inds, dtype=tf.int64)], axis=0, name="sampled_labels")
+
+	# pad the activity box labels to the proposal boxes
+	# act_single_labels: [N,num_act_class] # included BG class at index 0
+
+	#[N_FG, num_class]
+	# there is 1:10 negative in N_FG
+	act_single_ret_labels = tf.gather(act_single_labels, fg_inds_wrt_gt)
+
+	# for pair box, [K,K,num_act_class] -> [N_FG+N_BG,N_FG+N_BG, num_act_class]
+	# 1, get [N_FG,N_FG,num_act_class]
+	# [N_FG, 2] 
+	"""
+	tiled_fg_inds_wrt_gt = tf.tile(tf.expand_dims(fg_inds_wrt_gt,1),[1,2])
+	act_pair_fg_labels = tf.gather_nd(act_pair_labels,tiled_fg_inds_wrt_gt)
+
+	# [N_BG,N_FG,num_act_class]
+	act_pad_bg = tf.zeros((tf.size(bg_inds),tf.size(fg_inds),tf.shape(act_single_labels)[-1]), dtype=tf.int64)
+	act_pad_bg[:,:,0] = 1 # BG class should be 1
+	# [N_FG+N_BG,N_BG,num_act_class]
+	act_pad_bg2 = tf.zeros((tf.size(bg_inds)+tf.size(fg_inds),tf.size(bg_inds),tf.shape(act_single_labels)[-1]), dtype=tf.int64)
+	act_pad_bg2[:,:,0] = 1 # BG class should be 1
+
+	# [N_FG+N_BG,N_FG,num_act_class]
+	act_pair_ret_labels = tf.concat([act_pair_fg_labels,act_pad_bg],axis=0)
+	# [N_FG+N_BG,N_FG+N_BG,num_act_class]
+	act_pair_ret_labels = tf.concat([act_pair_ret_labels,act_pad_bg2],axis=0)
+	"""
+
+	return tf.stop_gradient(ret_boxes),tf.stop_gradient(ret_labels),tf.stop_gradient(act_single_ret_labels),None, fg_inds_wrt_gt
+
+
+# given the proposal box, decide the positive and negatives
+def sample_fast_rcnn_targets(boxes, gt_boxes, gt_labels, config,fg_ratio=None):
+
+	iou = pairwise_iou(boxes,gt_boxes)
+
+	# gt_box directly used as proposal
+	boxes = tf.concat([boxes,gt_boxes],axis=0)
+	iou = tf.concat([iou, tf.eye(tf.shape(gt_boxes)[0])],axis=0)
+	# [N+M,M]
+
+	def sample_fg_bg(iou,fg_ratio):
+		# [K,M] # [M] is the ground truth
+		# [K] # max iou for each proposal to the ground truth
+		fg_mask = tf.reduce_max(iou,axis=1) >= config.fastrcnn_fg_thres # 0.5
+		fg_inds = tf.reshape(tf.where(fg_mask),[-1]) # [K_FG] # index of fg_mask true element
+		num_fg = tf.minimum(int(config.fastrcnn_batch_per_im * fg_ratio),tf.size(fg_inds))
+		# during train time, each time random sample
+		fg_inds = tf.random_shuffle(fg_inds)[:num_fg]# so the pos box is at least > fg_thres iou
+
+		bg_inds = tf.reshape(tf.where(tf.logical_not(fg_mask)), [-1])
+		num_bg = tf.minimum(config.fastrcnn_batch_per_im - num_fg,tf.size(bg_inds))
+		bg_inds = tf.random_shuffle(bg_inds)[:num_bg]
+
+		return fg_inds,bg_inds
+
+	if fg_ratio is None:
+		fg_ratio = config.fastrcnn_fg_ratio
+	# get random pos neg from over some iou thres from [N+M]
+	fg_inds,bg_inds = sample_fg_bg(iou,fg_ratio)
+
+	best_iou_ind = tf.argmax(iou, axis=1) #[N+M],# proposal -> gt best matched# so each proposal has the gt's index
+	# [N_FG] -> gt Index, so 0-M-1
+	# each pos proposal box assign to the best gt box
+	# indexes of gt_boxes that matched to fg_box
+	fg_inds_wrt_gt = tf.gather(best_iou_ind, fg_inds) # get the pos's gt box indexes
+
+	all_indices = tf.concat([fg_inds,bg_inds],axis=0)
+
+	# selected proposal boxes
+	ret_boxes = tf.gather(boxes, all_indices, name="sampled_proposal_boxes")
+
+	ret_labels = tf.concat([tf.gather(gt_labels, fg_inds_wrt_gt),tf.zeros_like(bg_inds, dtype=tf.int64)], axis=0, name="sampled_labels")
+	return tf.stop_gradient(ret_boxes),tf.stop_gradient(ret_labels), fg_inds_wrt_gt
+
+
+
+
+# fix the tf.image.crop_and_resize to do roi_align
+def crop_and_resize(image, boxes, box_ind, crop_size,pad_border=False):
+	# image feature [1,C,FS,FS] # for mask gt [N_FG, 1, H, W]
+	# boxes [N,4]
+	# box_ind [N] all zero?
+
+	if pad_border:
+		image = tf.pad(image, [[0, 0], [0, 0], [1, 1], [1, 1]], mode='SYMMETRIC')
+		boxes = boxes + 1
+
+	# return [N,C,crop_size,crop_size]
+	def transform_fpcoor_for_tf(boxes, image_shape,crop_shape):
+		"""
+		The way tf.image.crop_and_resize works (with normalized box):
+		Initial point (the value of output[0]): x0_box * (W_img - 1)
+		Spacing: w_box * (W_img - 1) / (W_crop - 1)
+		Use the above grid to bilinear sample.
+
+		However, what we want is (with fpcoor box):
+		Spacing: w_box / W_crop
+		Initial point: x0_box + spacing/2 - 0.5
+		(-0.5 because bilinear sample assumes floating point coordinate (0.0, 0.0) is the same as pixel value (0, 0))
+
+		This function transform fpcoor boxes to a format to be used by tf.image.crop_and_resize
+
+		Returns:
+			y1x1y2x2
+		"""
+		x0, y0, x1, y1 = tf.split(boxes, 4, axis=1)
+
+		spacing_w = (x1 - x0) / tf.to_float(crop_shape[1])
+		spacing_h = (y1 - y0) / tf.to_float(crop_shape[0])
+
+		nx0 = (x0 + spacing_w / 2 - 0.5) / tf.to_float(image_shape[1] - 1)
+		ny0 = (y0 + spacing_h / 2 - 0.5) / tf.to_float(image_shape[0] - 1)
+
+		nw = spacing_w * tf.to_float(crop_shape[1] - 1) / tf.to_float(image_shape[1] - 1)
+		nh = spacing_h * tf.to_float(crop_shape[0] - 1) / tf.to_float(image_shape[0] - 1)
+
+		return tf.concat([ny0, nx0, ny0 + nh, nx0 + nw], axis=1)
+
+	image_shape = tf.shape(image)[2:]
+	boxes = transform_fpcoor_for_tf(boxes, image_shape, [crop_size, crop_size])
+	image = tf.transpose(image, [0, 2, 3, 1])   # 1hwc
+	ret = tf.image.crop_and_resize(
+		image, boxes, box_ind,
+		crop_size=[crop_size, crop_size])
+	ret = tf.transpose(ret, [0, 3, 1, 2])   # Ncss
+	return ret
+
+
+# given [1,C,FS,FS] featuremap, and the boxes [K,4], where coordiates are in FS
+# get fixed size feature for each box [K,C,output_shape,output_shape]
+# crop the box and resize to a shape
+# here resize with bilinear pooling to twice large box, then average pooling
+def roi_align(featuremap, boxes, output_shape):
+	boxes = tf.stop_gradient(boxes)
+	# [1,C,FS,FS] -> [K,C,out_shape*2,out_shape*2]
+	ret = crop_and_resize(featuremap, boxes, tf.zeros([tf.shape(boxes)[0]], dtype=tf.int32), output_shape * 2)
+	ret = tf.nn.avg_pool(ret, ksize=[1,1,2,2],strides=[1,1,2,2],padding='SAME', data_format="NCHW")
+	return ret
+
+
+
+# given boxes, clip the box to be within the image
+def clip_boxes(boxes, image_shape, name=None):
+	boxes = tf.maximum(boxes, 0.0) # lower bound
+	# image_shape is HW, 
+	# HW -> [W, H, W, H] # <- box
+	m = tf.tile(tf.reverse(image_shape, [0]), [2])
+	boxes = tf.minimum(boxes, tf.to_float(m), name=name) # upper bound
+	return boxes
+
+
+# given all the anchor box and their logits, get the proposal box
+# rank and filter, then nms
+# boxes [-1,4], scores [-1]
+def generate_rpn_proposals(boxes, scores, img_shape,config,pre_nms_topk=None): # image shape : HW
+	# for FPN
+	if pre_nms_topk is not None:
+		post_nms_topk = pre_nms_topk
+	else:
+		# there may be problem for validation during training
+		# no problem, we have two model when training
+		if config.is_train:
+			pre_nms_topk = config.rpn_train_pre_nms_topk
+			post_nms_topk = config.rpn_train_post_nms_topk
+		else:
+			pre_nms_topk = config.rpn_test_pre_nms_topk
+			post_nms_topk = config.rpn_test_post_nms_topk
+
+
+	# clip [FS*FS*num_anchors] at the beginning
+	topk = tf.minimum(pre_nms_topk, tf.size(scores))
+	topk_scores,topk_indices = tf.nn.top_k(scores,k=topk,sorted=False)
+	# top_k indices -> [topk]
+	# get [topk,4]
+	topk_boxes = tf.gather(boxes, topk_indices)
+	topk_boxes = clip_boxes(topk_boxes, img_shape)
+
+	topk_boxes_x1y1,topk_boxes_x2y2 = tf.split(topk_boxes, 2, axis=1)
+
+	topk_boxes_x1y1x2y2 = tf.reshape(topk_boxes,(-1,2,2))
+
+	# rpn min size
+	wbhb = topk_boxes_x2y2 - topk_boxes_x1y1
+	valid = tf.reduce_all(wbhb > config.rpn_min_size, axis=1)
+	topk_valid_boxes_x1y1x2y2 = tf.boolean_mask(topk_boxes_x1y1x2y2, valid)
+	topk_valid_scores = tf.boolean_mask(topk_scores, valid)
+
+
+	# for nms input
+	topk_valid_boxes_y1x1y2x2 = tf.reshape(tf.reverse(topk_valid_boxes_x1y1x2y2, axis=[2]),(-1,4),name="nms_input_boxes")
+	# [TOPK]
+	nms_indices = tf.image.non_max_suppression(topk_valid_boxes_y1x1y2x2,topk_valid_scores,max_output_size=post_nms_topk,iou_threshold=config.rpn_proposal_nms_thres)
+
+	topk_valid_boxes = tf.reshape(topk_valid_boxes_x1y1x2y2, (-1,4))
+	# (TOPK,4)
+	final_boxes = tf.gather(topk_valid_boxes, nms_indices,name="boxes")
+	final_scores = tf.gather(topk_valid_scores, nms_indices,name="scores")
+
+	return final_boxes, final_scores
+
+
+
+
+
+# given the anchor regression prediction, 
+# get the refined anchor boxes
+def decode_bbox_target(box_predictions, anchors,decode_clip=np.log(1333/16.0)):
+	box_pred_txtytwth = tf.reshape(box_predictions, (-1,4)) 
+	# [FS,FS,num_anchors,4] -> [All,2] 
+	box_pred_txty,box_pred_twth = tf.split(box_pred_txtytwth, 2, axis=1)
+
+	# get the original anchor box from x1y1x2y2 to center xaya and wh
+	anchors_x1y1x2y2 = tf.reshape(anchors, (-1, 4))
+	anchors_x1y1, anchors_x2y2 = tf.split(anchors_x1y1x2y2, 2, axis=1)
+	waha = anchors_x2y2 - anchors_x1y1
+	xaya = (anchors_x2y2 + anchors_x1y1) * 0.5
+
+	# get the refined box
+	# predicted twth is in log
+	wbhb = tf.exp(tf.minimum(box_pred_twth, decode_clip)) * waha
+	xbyb = box_pred_txty * waha + xaya
+
+	# get the refined box in x1y1x2y2
+	x1y1 = xbyb - wbhb*0.5
+	x2y2 = xbyb + wbhb*0.5
+	out = tf.concat([x1y1,x2y2],axis=-1) # [All,4]
+	return tf.reshape(out,tf.shape(anchors))
+
+def resizeImage(im, short_size, max_size):
+	h,w = im.shape[:2]
+	neww,newh = get_new_hw(h,w,short_size, max_size)
+	return cv2.resize(im,(neww,newh),interpolation=cv2.INTER_LINEAR)
+
+def get_new_hw(h,w,size,max_size):
+	scale = size * 1.0 / min(h, w)
+	if h < w:
+		newh, neww = size, scale * w
+	else:
+		newh, neww = scale * h, size
+	if max(newh, neww) > max_size:
+		scale = max_size * 1.0 / max(newh, neww)
+		newh = newh * scale
+		neww = neww * scale
+	neww = int(neww + 0.5)
+	newh = int(newh + 0.5)
+	return neww,newh
+
+# given MxM mask, put it to the whole (4) image
+# TODO, make it just to box size to save memroy?
+def fill_full_mask(box, mask, im_shape):
+	# int() is floor
+	# box fpcoor=0.0 -> intcoor=0.0
+	x0, y0 = list(map(int, box[:2] + 0.5))
+	# box fpcoor=h -> intcoor=h-1, inclusive
+	x1, y1 = list(map(int, box[2:] - 0.5))	# inclusive
+	x1 = max(x0, x1) # require at least 1x1
+	y1 = max(y0, y1)
+
+	w = x1 + 1 - x0
+	h = y1 + 1 - y0
+
+	# rounding errors could happen here, because masks were not originally computed for this shape.
+	# but it's hard to do better, because the network does not know the "original" scale
+	mask = (cv2.resize(mask, (w, h)) > 0.5).astype('uint8')
+	ret = np.zeros(im_shape, dtype='uint8')
+	ret[y0:y1 + 1, x0:x1 + 1] = mask
+	return ret
+
+
+# get the diff (t_x,t_y,t_w,t_h) for each target anchor and original anchor
+def encode_bbox_target(target_boxes,anchors):
+	# target_boxes, [FS,FS,num_anchors,4] # each anchor's nearest assigned gt bounding box ## some may be zero, so some anchor doesn't match to any gt bounding box
+	# anchors, [FS,FS,num_anchors,4] # all posible anchor box
+	with tf.name_scope("encode_bbox_target"):
+		# encode the box to center xy and wh
+		# as the Faster-RCNN paper 
+		anchors_x1y1x2y2 = tf.reshape(anchors,(-1,4)) # (N_num_anchors,X,Y)
+		anchors_x1y1, anchors_x2y2 = tf.split(anchors_x1y1x2y2, 2, axis = 1)
+		# [N_num_anchors,2]
+		# get the box center x,y and w,h
+		waha = anchors_x2y2 - anchors_x1y1
+		xaya = (anchors_x2y2 + anchors_x1y1) * 0.5
+
+		target_boxes_x1y1x2y2 = tf.reshape(target_boxes,(-1,4)) # (N_num_anchors,X,Y)
+		target_boxes_x1y1, target_boxes_x2y2 = tf.split(target_boxes_x1y1x2y2, 2, axis = 1)
+		# [N_num_anchors,2]
+		# get the box center x,y and w,h
+		wghg = target_boxes_x2y2 - target_boxes_x1y1
+		xgyg = (target_boxes_x2y2 + target_boxes_x1y1) * 0.5
+
+		# some box is zero for non-positive anchor
+		TxTy = (xgyg - xaya) / waha
+		TwTh = tf.log(wghg / waha)
+		encoded = tf.concat([TxTy,TwTh],axis =-1)# [N_num_anchors,4]
+		return tf.reshape(encoded,tf.shape(target_boxes))
+
+
+
+def focal_loss(logits,labels,alpha=0.25, gamma=2):
+	# labels are one-hot encode
+	# [-1, num_classes]
+	sigmoid_p = tf.nn.sigmoid(logits)
+	zeros = tf.zeros_like(sigmoid_p,dtype=sigmoid_p.dtype)
+
+	pos_p_sub = tf.where(labels > zeros, labels - sigmoid_p, zeros)
+
+	neg_p_sub = tf.where(labels > zeros, zeros, labels - sigmoid_p)
+
+	focal_loss = - alpha * (pos_p_sub ** gamma) * tf.log(tf.clip_by_value(sigmoid_p, 1e-8, 1.0)) - (1 - alpha) * (neg_p_sub ** gamma) * tf.log(tf.clip_by_value(1.0 - sigmoid_p, 1e-8, 1.0))
+
+	return tf.reduce_sum(focal_loss)
 

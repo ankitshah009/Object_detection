@@ -9,6 +9,7 @@ from collections import defaultdict
 import math,sys,os,random
 import numpy as np
 import cv2
+import pycocotools.mask as cocomask
 
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
@@ -100,6 +101,160 @@ class Dataset():
 			#print batch_datas
 			yield batch_idxs, [Dataset(batch_data) for batch_data in batch_datas]
 
+# helper function for eval
+def gather_dt(boxes,probs,labels,eval_target,targetid2class,tococo=False,coco_class_names=None):
+	target_dt_boxes = {one:[] for one in eval_target.keys()}
+	for box, prob, label in zip(boxes,probs,labels):
+		# coco box
+		box[2] -= box[0]
+		box[3] -= box[1]
+
+		assert label > 0
+
+		if tococo:
+			cat_name = coco_class_names[label]
+		else:
+			# diva class trained from scratch
+			cat_name = targetid2class[label]
+
+		target_class = None
+
+		if tococo:
+			for t in eval_target:
+				if cat_name in eval_target[t]:
+					target_class = t
+		else:
+			if cat_name in eval_target:
+				target_class = cat_name
+
+		if target_class is None: # box from other class of mscoco/diva
+			continue
+
+		prob = float(round(prob,4))
+		box = list(map(lambda x:float(round(x,2)),box))
+
+		target_dt_boxes[target_class].append((box,prob))
+	return target_dt_boxes
+
+def aggregate_eval(e,maxDet=100):
+	aps = {}
+	ars = {}
+	for catId in e:
+		e_c = e[catId]
+		# put all detection scores from all image together
+		dscores = np.concatenate([e_c[imageid]['dscores'][:maxDet] for imageid in e_c])
+		# sort
+		inds = np.argsort(-dscores,kind="mergesort")
+		dscores_sorted = dscores[inds]
+
+		# put all detection annotation together based on the score sorting
+		dm = np.concatenate([e_c[imageid]['dm'][:maxDet] for imageid in e_c])[inds]
+		num_gt = np.sum([e_c[imageid]['gt_num'] for imageid in e_c])
+
+		aps[catId] = computeAP(dm)
+		ars[catId] = computeAR_2(dm,num_gt)
+	return aps,ars
+def weighted_average(aps,ars,eval_target_weight):
+
+	if eval_target_weight is not None:
+		average_ap = sum([aps[class_]*eval_target_weight[class_] for class_ in aps])
+		average_ar = sum([ars[class_]*eval_target_weight[class_] for class_ in ars])
+	else:
+		average_ap = sum(aps.values())/float(len(aps))
+		average_ar = sum(ars.values())/float(len(ars))
+
+	return average_ap,average_ar
+
+def gather_gt(anno_boxes,anno_labels,eval_target,targetid2class):
+	gt_boxes = {one:[] for one in eval_target.keys()}
+	for box, label in zip(anno_boxes,anno_labels):
+		label = targetid2class[label]
+		if label in eval_target:
+			gt_box = list(map(lambda x:float(round(x,1)),box))
+			# gt_box is in (x1,y1,x2,y2)
+			# convert to coco box
+			gt_box[2]-=gt_box[0]
+			gt_box[3]-=gt_box[1]
+
+			gt_boxes[label].append(gt_box)
+	return gt_boxes
+
+# change e in place
+def match_dt_gt(e, imgid, target_dt_boxes, gt_boxes, eval_target):
+	for target_class in eval_target.keys():
+		#if len(gt_boxes[target_class]) == 0:
+		#	continue
+		target_dt_boxes[target_class].sort(key=operator.itemgetter(1),reverse=True)
+		d = [box for box,prob in target_dt_boxes[target_class]]
+		dscores = [prob for box,prob in target_dt_boxes[target_class]]
+		g = gt_boxes[target_class]
+
+		dm,gm = match_detection(d,g,cocomask.iou(d,g,[0 for _ in xrange(len(g))]),iou_thres=0.5)
+
+		e[target_class][imgid] = {
+			"dscores":[],
+			"dm":[],
+			"gt_num":len(g),
+		}
+
+		
+		e[target_class][imgid]['dscores'] = dscores
+		e[target_class][imgid]['dm'] = dm
+
+# for activity boxes
+def gather_act_singles(actsingleboxes,actsinglelabels,topk):
+	single_act_boxes = []
+	single_act_labels = []
+	single_act_probs = []
+	# [K,num_act_class]
+	# descending order
+	sorted_prob_single = np.argsort(actsinglelabels,axis=-1)[:,::-1]
+	BG_ids = sorted_prob_single[:, 0] == 0 # [K] of bool
+	
+	for j in xrange(len(actsinglelabels)):
+		if BG_ids[j]:
+			continue
+		labelIds = [sorted_prob_single[j,k] for k in xrange(topk)]
+		# ignore BG class # or ignore everything after BG class?
+		this_labels = [lid for lid in labelIds if lid != 0] 
+		this_probs = [actsinglelabels[j,lid] for lid in this_labels]
+		this_boxes = [actsingleboxes[j] for _ in xrange(len(this_labels))]
+
+		single_act_probs.extend(this_probs)
+		single_act_labels.extend(this_labels)
+		single_act_boxes.extend(this_boxes)
+	return single_act_boxes,single_act_labels,single_act_probs
+
+def match_detection(d,g,ious,iou_thres=0.5):
+	D = len(d)
+	G = len(g)
+	# < 0 to note it is not matched, once matched will be the index of the d
+	gtm = -np.ones((G)) # whether a gt box is matched
+	dtm = -np.ones((D))
+
+	# for each detection bounding box (ranked), will get the best IoU matched ground truth box
+	for didx,_ in enumerate(d):
+		iou = iou_thres # the matched iou
+		m = -1 # used to remember the matched gidx
+		for gidx,_ in enumerate(g):
+			# if this gt box is matched
+			if gtm[gidx] >= 0:
+				continue
+
+			# the di,gi pair doesn't have the required iou
+			# or not better than before
+			if ious[didx,gidx] < iou: 
+				continue
+
+			# got one
+			iou=ious[didx,gidx]
+			m = gidx
+
+		if m == -1:
+			continue
+		gtm[m] = didx
+		dtm[didx] = m
+	return dtm,gtm
 
 def get_all_anchors(stride,sizes,ratios,max_size):
 	"""
@@ -193,26 +348,7 @@ def sec2time(secs):
 		return "%02d:%02d:0%.3f"%(h,m,s)
 
 import operator
-def computeAP(lists):
-	#先排序
-	lists.sort(key=operator.itemgetter("score"),reverse=True)
-	#print lists[0]
-	#计算ap
-	#相关的总数
-	rels = 0
-	#当前排名
-	rank = 0
-	#AP 分数
-	score = 0.0
-	for one in lists:
-		rank+=1
-		#是相关的
-		if(one['label'] == 1):
-			rels+=1
-			score+=rels/float(rank)
-	if(rels != 0):
-		score/=float(rels)
-	return score
+
 
 def get_op_tensor_name(name):
 	"""
@@ -337,36 +473,7 @@ def computeAR_2(d,num_gt):
 	else:
 		return true_positives/float(num_gt)
 
-def match_detection(d,g,ious,iou_thres=0.5):
-	D = len(d)
-	G = len(g)
-	# < 0 to note it is not matched, once matched will be the index of the d
-	gtm = -np.ones((G)) # whether a gt box is matched
-	dtm = -np.ones((D))
 
-	# for each detection bounding box (ranked), will get the best IoU matched ground truth box
-	for didx,_ in enumerate(d):
-		iou = iou_thres # the matched iou
-		m = -1 # used to remember the matched gidx
-		for gidx,_ in enumerate(g):
-			# if this gt box is matched
-			if gtm[gidx] >= 0:
-				continue
-
-			# the di,gi pair doesn't have the required iou
-			# or not better than before
-			if ious[didx,gidx] < iou: 
-				continue
-
-			# got one
-			iou=ious[didx,gidx]
-			m = gidx
-
-		if m == -1:
-			continue
-		gtm[m] = didx
-		dtm[didx] = m
-	return dtm,gtm
 
 # copied from https://stackoverflow.com/questions/2328339/how-to-generate-n-different-colors-for-any-natural-number-n
 PALETTE_HEX = [

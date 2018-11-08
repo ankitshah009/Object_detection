@@ -112,10 +112,13 @@ class Trainer():
 		
 		if config.add_act:
 			out = [self.loss,self.rpn_label_loss, self.rpn_box_loss, self.fastrcnn_label_loss, self.fastrcnn_box_loss,self.train_op]
-			out = self.models[0].act_losses + out
+
+			act_losses_pl = [model.act_losses for model in self.models]
+			out = act_losses_pl + out
 			things = sess.run(out,feed_dict=feed_dict)
-			act_losses = things[:len(self.models[0].act_losses)]
-			loss,rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss, train_op = things[len(self.models[0].act_losses):]
+			act_losses = things[:len(act_losses_pl)]
+
+			loss,rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss, train_op = things[len(act_losses_pl):]
 		else:
 			loss,rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss, train_op = sess.run([self.loss,self.rpn_label_loss, self.rpn_box_loss, self.fastrcnn_label_loss, self.fastrcnn_box_loss,self.train_op],feed_dict=feed_dict)
 			act_losses = None

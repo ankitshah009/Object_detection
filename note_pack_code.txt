@@ -1,0 +1,75 @@
+1. install docker-ce from https://docs.docker.com/install/linux/docker-ce/ubuntu/#install-docker-ce-1
+2. install nvidia-docker2 https://github.com/NVIDIA/nvidia-docker
+3. start with tensorflow docker
+
+sudo docker run -it -v /home/junweil/object_detection/script/tf_mrcnn/:/home/app -v /mnt/ssd1/junweil/object_detection/diva/pack_code_test/:/home/test_data --runtime=nvidia tensorflow/tensorflow:latest-gpu /bin/bash
+
+install more stuff
+	apt-get update
+	pip install tqdm
+	apt-get install python-opencv
+	apt-get install python-tk
+	tf 1.10
+
+
+mv code to /app/
+
+ctrl-d
+sudo docker ps -a   [ get the container Id]
+sudo docker commit 82391eb5285a junweil_object_detection
+
+Test:
+	sudo docker run -it --rm --runtime=nvidia -v /mnt/ssd1/junweil/object_detection/diva/pack_code_test/:/tmp junweil_object_detection /bin/bash
+
+	root@fdb46752aea2:/notebooks# python /app/obj_detect.py --video_dir /tmp/training_minival --video_lst_file /tmp/training_minival.lst --out_dir /tmp/output_framegap4 --visualize --vis_path /tmp/output_vis_framegap4 --frame_gap 4 --threshold_conf 0.0001
+
+
+make visualize video: #can only visualize with framegap 1
+	junweil@vid-gpu7:/mnt/ssd1/junweil/object_detection/diva/pack_code_test$ filepath=output_vis_framegap1_conf0.0001;mkdir ${filepath}_videos;cat training_minival.lst |for line in $(cat training_minival.lst);do echo $line;ffmpeg -y -framerate 30 -i ${filepath}/${line}_F_%08d.jpg ${filepath}_videos/$line ;done
+
+change image name
+	sudo docker image tag junweil_object_detection:latest junweil/object_detection:actev
+
+save to a tar file
+	junweil@vid-gpu7:/mnt/ssd1/junweil/object_detection/diva/pack_code_test$ sudo docker save junweil/object_detection:actev > junweil_object_detection.tar
+
+
+Run Time:
+	(20:12 5 videos)
+	(object detection + writing visualize jpg, single TITANX gpu with one other gpu job running)
+	--rpn_test_post_nms_topk 1000
+
+	--rpn_test_post_nms_topk 2000
+	1framegap 5:49:02
+	4framegap 1:18:21
+	8framegap 40:56
+
+	--rpn_test_post_nms_topk 1000
+	1framegap 4:28:26
+	4framegap 1:16:53
+	8framegap 36:14
+
+
+# test on the AWS server
+	1. load the docker image
+		informedia@ip-172-31-26-183:~/object_detection/pack_code_test$ docker load --input junweil_object_detection.tar
+
+	2. create container interactive
+		informedia@ip-172-31-26-183:~/object_detection/pack_code_test$ docker run -it --rm --runtime=nvidia -v /home/informedia/object_detection/pack_code_test/:/tmp junweil/object_detection:actev /bin/bash
+
+	3. run detection (on gpuid 1)
+		root@ea7d0385a913:/notebooks# python /app/obj_detect.py --video_dir /tmp/training_minival --video_lst_file /tmp/training_minival.lst --out_dir /tmp/output_framegap8_aws --visualize --vis_path /tmp/output_vis_framegap8_aws --frame_gap 8 --threshold_conf 0.0001 --gpuid_start 1 --gpu 1
+
+
+# update the docker image
+	1. change the code
+	2. start the lastest version of docker image and mount the code
+		junweil@vid-gpu7:/mnt/ssd1/junweil/object_detection/diva/pack_code_test$ sudo docker run -it --runtime=nvidia -v /home/junweil/object_detection/script/tf_mrcnn:/tmp junweil/object_detection:actev /bin/bash
+
+	3. replace the code inside the interactive mode
+		root@38ee71d13276:/notebooks# cp /tmp/obj_detect.py /app/
+
+	4. exit and commit the new image
+		sudo docker ps -a [find the new container Id]
+		junweil@vid-gpu7:/mnt/ssd1/junweil/object_detection/diva/pack_code_test$ sudo docker commit 38ee71d13276 junweil/object_detection:actev
+		
