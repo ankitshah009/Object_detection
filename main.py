@@ -177,6 +177,7 @@ def get_args():
 	parser.add_argument("--gpu",default=1,type=int,help="number of gpu")
 	parser.add_argument("--gpuid_start",default=0,type=int,help="start of gpu id")
 	parser.add_argument("--model_per_gpu",default=1,type=int,help="it will be set as a /task:k in device")
+	parser.add_argument("--controller",default="/cpu:0",help="controller for multigpu training")
 	
 
 	#parser.add_argument("--num_step",type=int,default=360000) 
@@ -213,7 +214,7 @@ def get_args():
 
 	assert args.model_per_gpu == 1, "not work yet!"
 	assert args.gpu*args.model_per_gpu == args.im_batch_size # one gpu one image
-	args.controller = "/cpu:0" # parameter server
+	#args.controller = "/cpu:0" # parameter server
 
 	assert int(args.diva_class) + int(args.tococo) == 1
 
