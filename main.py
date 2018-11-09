@@ -706,7 +706,7 @@ def train_diva(config):
 	# start training!
 	# allow_soft_placement :  tf will auto select other device if the tf.device(*) not available
 
-	tfconfig = tf.ConfigProto(allow_soft_placement=True)
+	tfconfig = tf.ConfigProto(allow_soft_placement=True)#,log_device_placement=True)
 	if not config.use_all_mem:
 		tfconfig.gpu_options.allow_growth = True # this way it will only allocate nessasary gpu, not take all
 

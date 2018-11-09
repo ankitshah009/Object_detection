@@ -51,14 +51,14 @@ def get_model(config,gpuid=0,task=0,controller="/cpu:0"):
 			#tf.get_variable_scope().reuse_variables()
 			if config.add_act:
 				if config.act_v2:
-					model = Mask_RCNN_FPN_Act2(config)
+					model = Mask_RCNN_FPN_Act2(config,gpuid=gpuid)
 				else:
-					model = Mask_RCNN_FPN_Act(config)
+					model = Mask_RCNN_FPN_Act(config,gpuid=gpuid)
 			else:
 				if config.is_fpn:
-					model = Mask_RCNN_FPN(config)
+					model = Mask_RCNN_FPN(config,gpuid=gpuid)
 				else:
-					model = Mask_RCNN(config)
+					model = Mask_RCNN(config,gpuid=gpuid)
 
 	return model
 
@@ -805,8 +805,8 @@ class Mask_RCNN():
 
 
 class Mask_RCNN_FPN():
-	def __init__(self,config):
-
+	def __init__(self,config,gpuid=0):
+		self.gpuid = gpuid
 		# for batch_norm
 		global is_training
 		is_training = config.is_train # change this before building model
@@ -1881,8 +1881,8 @@ class Mask_RCNN_FPN():
 		return anchor_labels, anchor_boxes
 
 class Mask_RCNN_FPN_Act():
-	def __init__(self,config):
-
+	def __init__(self,config,gpuid=0):
+		self.gpuid = gpuid
 		# for batch_norm
 		global is_training
 		is_training = config.is_train # change this before building model

@@ -5,6 +5,7 @@
 
 import tensorflow as tf
 import sys
+from models import assign_to_device
 
 def average_gradients(tower_grads):
 	"""Calculate the average gradient for each shared variable across all towers.
@@ -77,15 +78,18 @@ class Trainer():
 		self.losses = []
 		self.grads = []
 		for model in self.models:
-			self.losses.append(model.loss)
-			grad = self.opt.compute_gradients(model.loss)
+			gpuid = model.gpuid
+			# compute gradients on each gpu devices
+			with tf.device(assign_to_device("/gpu:%s"%(gpuid), config.controller)):
+				self.losses.append(model.loss)
+				grad = self.opt.compute_gradients(model.loss)
 
-			grad = [(g,var) for g, var in grad if g is not None] # we freeze resnet, so there will be none gradient
+				grad = [(g,var) for g, var in grad if g is not None] # we freeze resnet, so there will be none gradient
 
-			# whehter to clip gradient
-			if config.clip_gradient_norm is not None:
-				grad = [(tf.clip_by_value(g, -1*config.clip_gradient_norm, config.clip_gradient_norm), var) for g, var in grad]
-			self.grads.append(grad)
+				# whehter to clip gradient
+				if config.clip_gradient_norm is not None:
+					grad = [(tf.clip_by_value(g, -1*config.clip_gradient_norm, config.clip_gradient_norm), var) for g, var in grad]
+				self.grads.append(grad)
 		
 		# apply gradient on the controlling device
 		with tf.device(config.controller):
