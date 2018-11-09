@@ -588,7 +588,7 @@ def resnet_conv5(image,num_block,reuse=False,tf_pad_reverse=False):
 	return l
 
 # fpn_resolution_requirement is 32 by default FPN
-def resnet_fpn_backbone(image, num_blocks,resolution_requirement,tf_pad_reverse=False,finer_resolution=False):
+def resnet_fpn_backbone(image, num_blocks,resolution_requirement,tf_pad_reverse=False,finer_resolution=False,freeze=0):
 	assert len(num_blocks) == 4
 	shape2d = tf.shape(image)[2:]
 	# padding to deal with odd size image?
@@ -615,12 +615,19 @@ def resnet_fpn_backbone(image, num_blocks,resolution_requirement,tf_pad_reverse=
 
 	#print l.get_shape()# (1,64,?,?)
 	c2 = resnet_group(l, 'group0', resnet_bottleneck, 64, num_blocks[0], stride=1,tf_pad_reverse=tf_pad_reverse)
-	# never freeze from here on
+	if freeze >= 0:
+		c2 = tf.stop_gradient(c2)
 	#print l.get_shape()# (1,256,?,?)
 	c3 = resnet_group(c2, 'group1', resnet_bottleneck, 128, num_blocks[1], stride=2,tf_pad_reverse=tf_pad_reverse)
+	if freeze >= 1:
+		c3 = tf.stop_gradient(c3)
 	#print l.get_shape()# (1,512,?,?)
 	c4 = resnet_group(c3, 'group2', resnet_bottleneck, 256, num_blocks[2], stride=2,tf_pad_reverse=tf_pad_reverse)
+	if freeze >= 2:
+		c4 = tf.stop_gradient(c4)
 	c5 = resnet_group(c4, "group3", resnet_bottleneck, 512, num_blocks[3], stride=2,tf_pad_reverse=tf_pad_reverse)
+	if freeze >= 3:
+		c5 = tf.stop_gradient(c5)
 	## 32x downsampling up to now
 	# size of c5: ceil(input/32)
 	if finer_resolution:

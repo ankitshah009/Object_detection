@@ -1043,19 +1043,12 @@ class Mask_RCNN_FPN():
 		# TODO: fix global param like data_format and 
 		# [1,C,FS,FS]
 		
-		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,finer_resolution=config.finer_resolution)
+		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,finer_resolution=config.finer_resolution,freeze=config.freeze)
 
 		# freeze backbone
-		c2,c3,c4,c5 = c2345
+		#c2,c3,c4,c5 = c2345
 		#c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),tf.stop_gradient(c5)
-		if config.freeze == 0:
-			c2345 = tf.stop_gradient(c2),c3,c4,c5
-		elif config.freeze == 1:
-			c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),c4,c5
-		elif config.freeze == 2:
-			c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),c5
-		else:
-			raise Exception("freeze resnet until group 0 or group 2")
+		
 
 		# include lateral 1x1 conv and final 3x3 conv
 		# -> [7,7,256]
@@ -2085,19 +2078,11 @@ class Mask_RCNN_FPN_Act():
 		# TODO: fix global param like data_format and 
 		# [1,C,FS,FS]
 		
-		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model)
+		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,freeze=config.freeze)
 
 		# freeze backbone
-		c2,c3,c4,c5 = c2345 # c4 will have the most parameter
+		#c2,c3,c4,c5 = c2345 # c4 will have the most parameter
 		#c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),tf.stop_gradient(c5)
-		if config.freeze == 0:
-			c2345 = tf.stop_gradient(c2),c3,c4,c5
-		elif config.freeze == 1:
-			c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),c4,c5
-		elif config.freeze == 2:
-			c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),c5
-		else:
-			raise Exception("freeze resnet until group 0 or group 2")
 
 
 		# include lateral 1x1 conv and final 3x3 conv
@@ -3073,11 +3058,11 @@ class Mask_RCNN_FPN_Act2():
 		# TODO: fix global param like data_format and 
 		# [1,C,FS,FS]
 		
-		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model)
+		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,freeze=config.freeze)
 
 		# freeze backbone
-		c2,c3,c4,c5 = c2345
-		c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),tf.stop_gradient(c5)
+		#c2,c3,c4,c5 = c2345
+		#c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),tf.stop_gradient(c5)
 
 		# include lateral 1x1 conv and final 3x3 conv
 		p23456 = fpn_model(c2345,num_channel=config.fpn_num_channel,scope="fpn")
