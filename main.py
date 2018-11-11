@@ -38,6 +38,7 @@ def get_args():
 	parser.add_argument("--actoutbasepath",type=str,default=None,help="for activity box forward only")
 
 	parser.add_argument("--train_skip",type=int,default=1,help="when load diva train set, skip how many.")
+	parser.add_argument("--train_skip_offset",type=int,default=0,help="when load diva train set, offset before skip")
 	parser.add_argument("--forward_skip",type=int,default=1,help="forward, skip how many.")
 
 	parser.add_argument("--modelname",type=str,default=None)
@@ -467,8 +468,8 @@ def read_data_diva(config,idlst,framepath,annopath,tococo=False,randp=None,is_tr
 	if (config.train_skip > 1) and is_train:
 		imgs.sort()
 		ori_num = len(imgs)
-		imgs = imgs[::config.train_skip]
-		print "skipping %s, got %s/%s"%(config.train_skip,len(imgs),ori_num)
+		imgs = imgs[config.train_skip_offset::config.train_skip]
+		print "skipping [%s::%s], got %s/%s"%(config.train_skip_offset,config.train_skip,len(imgs),ori_num)
 
 	for img in tqdm(imgs, ascii=True, smoothing=0.5):
 		
