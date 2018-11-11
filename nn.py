@@ -615,8 +615,10 @@ def resnet_fpn_backbone(image, num_blocks,resolution_requirement,tf_pad_reverse=
 
 	#print l.get_shape()# (1,64,?,?)
 	c2 = resnet_group(l, 'group0', resnet_bottleneck, 64, num_blocks[0], stride=1,tf_pad_reverse=tf_pad_reverse)
-	if freeze >= 0:
+	if freeze >= 0: # tensorpack setting
 		c2 = tf.stop_gradient(c2)
+
+
 	#print l.get_shape()# (1,256,?,?)
 	c3 = resnet_group(c2, 'group1', resnet_bottleneck, 128, num_blocks[1], stride=2,tf_pad_reverse=tf_pad_reverse)
 	if freeze >= 1:

@@ -1677,9 +1677,11 @@ def initialize(load,load_best,config,sess):
 		print "restoring model..."
 		allvars = tf.global_variables()
 		allvars = [var for var in allvars if "global_step" not in var.name]
-		restore_vars = allvars
+		#restore_vars = allvars
 		opts = ["Adam","beta1_power","beta2_power","Adam_1","Adadelta_1","Adadelta","Momentum"]
-		restore_vars = [var for var in restore_vars if var.name.split(":")[0].split("/")[-1] not in opts]
+		allvars = [var for var in allvars if var.name.split(":")[0].split("/")[-1] not in opts]
+		# so allvars is actually the variables except things for training
+
 		if config.ignore_vars is not None:
 			ignore_vars = config.ignore_vars.split(":")
 			ignore_vars.extend(opts)
