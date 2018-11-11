@@ -1699,9 +1699,11 @@ def initialize(load,load_best,config,sess):
 						break
 				if not ignore_it:
 					restore_vars.append(var)
-			
 
 			print "ignoring %s variables, original %s vars, restoring for %s vars"% (len(ignore_vars),len(allvars),len(restore_vars))
+
+		else:
+			restore_vars = allvars
 
 		saver = tf.train.Saver(restore_vars, max_to_keep=5)
 
