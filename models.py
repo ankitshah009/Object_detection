@@ -1613,8 +1613,8 @@ class Mask_RCNN_FPN():
 		else:
 			resized_image = resizeImage(image,short_edge_size,config.max_size)
 		newh,neww = resized_image.shape[:2]
-		print newh,neww, batch.data['imgs'][0]
-		sys.exit()
+		#print newh,neww, batch.data['imgs'][0]
+		#sys.exit()
 
 		if is_train:
 			anno = batch.data['gt'][0] # 'boxes' -> [K,4], 'labels' -> [K]
