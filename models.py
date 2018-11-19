@@ -1044,10 +1044,6 @@ class Mask_RCNN_FPN():
 		# [1,C,FS,FS]
 		
 		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,finer_resolution=config.finer_resolution,freeze=config.freeze)
-
-		# freeze backbone
-		#c2,c3,c4,c5 = c2345
-		#c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),tf.stop_gradient(c5)
 		
 
 		# include lateral 1x1 conv and final 3x3 conv

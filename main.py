@@ -132,6 +132,8 @@ def get_args():
 
 	parser.add_argument("--no_skip_error",action="store_true")
 
+	parser.add_argument("--show_stat",action="store_true",help="show data distribution only")
+
 	# use for pre-trained model
 	parser.add_argument("--load_from",type=str,default=None)
 	parser.add_argument("--ignore_vars",type=str,default=None,help="variables to ignore, multiple seperate by : like: logits/W:logits/b, this var only need to be var name's sub string to ignore")
@@ -354,11 +356,9 @@ def get_args():
 	args.rpn_fg_ratio = 0.5
 	args.rpn_batch_per_im = args.rpn_batch_size
 	args.rpn_min_size = 0 # 8?
+
 	args.rpn_proposal_nms_thres = 0.7
-	if args.obj_v2:
-		args.rpn_proposal_nms_thres = 0.5
-	if args.obj_v3:
-		args.rpn_proposal_nms_thres = 0.3
+
 	args.rpn_train_pre_nms_topk = 12000 # not used in fpn
 	args.rpn_train_post_nms_topk = 2000# this is used for fpn_nms_pre
 	if args.obj_v2:
@@ -471,6 +471,11 @@ def read_data_diva(config,idlst,framepath,annopath,tococo=False,randp=None,is_tr
 		imgs = imgs[config.train_skip_offset::config.train_skip]
 		print "skipping [%s::%s], got %s/%s"%(config.train_skip_offset,config.train_skip,len(imgs),ori_num)
 
+
+	# get starts for each img, the label distribution
+	label_dist = {classname:[] for classname in targetClass2id} # class -> [] num_box in each image
+	label_dist_all = []
+
 	for img in tqdm(imgs, ascii=True, smoothing=0.5):
 		
 		anno = os.path.join(annopath,"%s.npz"%img)
@@ -514,13 +519,18 @@ def read_data_diva(config,idlst,framepath,annopath,tococo=False,randp=None,is_tr
 			anno['labels'] = labels
 
 
-
 		#assert len(anno['boxes']) > 0
 		if len(anno['boxes']) == 0:
 			continue
 		assert len(anno['labels']) == len(anno['boxes']),(anno['labels'],anno['boxes'])
 		assert anno['boxes'].dtype == np.float32
 
+		# statics
+		if config.show_stat:
+			for classname in label_dist:
+				num_box_this_img = len([l for l in labels if l == targetClass2id[classname]])
+				label_dist[classname].append(num_box_this_img)
+			label_dist_all.append(len(labels))
 
 		if config.add_act:		
 			# for activity anno, we couldn't remove any of the boxes
@@ -580,6 +590,15 @@ def read_data_diva(config,idlst,framepath,annopath,tococo=False,randp=None,is_tr
 		data['gt'].append(anno)
 
 	print "loaded %s/%s data"%(len(data['imgs']),len(imgs))
+
+	if config.show_stat:
+		for classname in label_dist:
+			d = label_dist[classname]
+			ratios = [a/float(b) for a,b in zip(d, label_dist_all)]
+			print "%s, [%s - %s], median %s per img, ratio:[%.3f - %.3f], median %.3f, no label %s/%s [%.3f]"%(classname, min(d), max(d), np.median(d), min(ratios), max(ratios), np.median(ratios), len([i for i in d if i==0]), len(d),len([i for i in d if i==0])/float(len(d)))
+		print "each img has boxes: [%s - %s], median %s"%(min(label_dist_all),max(label_dist_all),np.median(label_dist_all),)
+
+
 	if len(ignored_classes) > 0:
 		print "ignored %s "%(ignored_classes.keys())
 	noDataClasses = [classname for classname in targetClass2exist if targetClass2exist[classname] ==0]
@@ -613,37 +632,27 @@ def train_diva(config):
 	eval_target_weight = None
 	if config.diva_class:
 		# only care certain classes
-		eval_target = ["Vehicle","Person","Construction_Barrier","Door","Dumpster","Prop","Push_Pulled_Object","Bike","Parking_Meter"]
+		#eval_target = ["Vehicle","Person","Construction_Barrier","Door","Dumpster","Prop","Push_Pulled_Object","Bike","Parking_Meter"]
+		eval_target = ["Vehicle","Person","Prop","Push_Pulled_Object","Bike"]
 		eval_target = {one:1 for one in eval_target}
 		eval_target_weight ={		
-			"Person":0.2,
+			"Person":0.15,
 			"Vehicle":0.15,
 			"Prop":0.15,
 			"Push_Pulled_Object":0.15,
-			"Bike":0.1,
-			"Door":0.1,
-			"Construction_Barrier":0.05,
-			"Dumpster":0.05,
-			"Parking_Meter":0.05,
+			"Bike":0.15,
 		}
-		assert sum(eval_target_weight.values()) == 1.0
-
-		
 
 		if config.merge_prop:
-			eval_target = ["Vehicle","Person","Construction_Barrier","Door","Dumpster","Prop","Push_Pulled_Object","Bike","Parking_Meter","Prop_plus_Push_Pulled_Object"]
+			eval_target = ["Vehicle","Person","Prop","Push_Pulled_Object","Bike", "Prop_plus_Push_Pulled_Object"]
 			eval_target = {one:1 for one in eval_target}
 			eval_target_weight ={		
 				"Person":0.15,
 				"Vehicle":0.15,
 				"Prop_plus_Push_Pulled_Object":0.2,
 				"Bike":0.2,
-				"Prop":0.05,
-				"Push_Pulled_Object":0.05,
-				"Door":0.05,
-				"Construction_Barrier":0.05,
-				"Dumpster":0.05,
-				"Parking_Meter":0.05,
+				"Prop":0.15,
+				"Push_Pulled_Object":0.15,
 			}
 
 	if config.add_act:
@@ -668,6 +677,9 @@ def train_diva(config):
 	train_data = read_data_diva(config,config.trainlst,config.imgpath,config.annopath,tococo=config.tococo,is_train=True) # True to filter data
 	val_data = read_data_diva(config,config.vallst,config.valframepath,config.valannopath,tococo=False)#,randp=0.02)
 	config.train_num_examples = train_data.num_examples
+
+	if config.show_stat:
+		sys.exit()
 
 	# the total step (iteration) the model will run
 	num_steps = int(math.ceil(train_data.num_examples/float(config.im_batch_size)))*config.num_epochs

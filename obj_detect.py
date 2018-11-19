@@ -43,6 +43,8 @@ def get_args():
 	# --- for internal visualization
 	parser.add_argument("--visualize",action="store_true")
 	parser.add_argument("--vis_path",default=None)
+	parser.add_argument("--vis_thres",default=0.7,type=float)
+	
 
 	# ----------- model params
 	parser.add_argument("--num_class",type=int,default=16,help="num catagory + 1 background")
@@ -292,6 +294,8 @@ if __name__ == "__main__":
 
 				# for visualization
 				if args.visualize:
+					good_ids = [i for i in xrange(len(final_boxes)) if final_probs[i] >= args.vis_thres]
+					final_boxes,final_labels,final_probs = final_boxes[good_ids],final_labels[good_ids],final_probs[good_ids]
 					vis_boxes = np.asarray([[box[0], box[1], box[2]+box[0], box[3]+box[1]] for box in final_boxes])
 					vis_labels = ["%s_%.2f"%(targetid2class[cat_id],prob) for cat_id,prob in zip(final_labels,final_probs)]
 					newim = draw_boxes(im,vis_boxes,vis_labels, color=np.array([255,0,0]),font_scale=0.5,thickness=2)
