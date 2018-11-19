@@ -1607,11 +1607,14 @@ class Mask_RCNN_FPN():
 		if config.scale_jitter and is_train:
 			short_edge_size = random.randint(config.short_edge_size_min,config.short_edge_size_max)
 
+
 		if batch.data.has_key("resized_image"):
 			resized_image = batch.data['resized_image'][0]
 		else:
 			resized_image = resizeImage(image,short_edge_size,config.max_size)
 		newh,neww = resized_image.shape[:2]
+		print newh,neww, batch.data['imgs'][0]
+		sys.exit()
 
 		if is_train:
 			anno = batch.data['gt'][0] # 'boxes' -> [K,4], 'labels' -> [K]
