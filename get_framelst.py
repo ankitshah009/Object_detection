@@ -16,6 +16,7 @@ def get_args():
 	parser.add_argument("annopath")
 	parser.add_argument("framelst")
 	parser.add_argument("--skip",type=int,default=10)
+	parser.add_argument("--check_frame",default=None)
 	return parser.parse_args()
 
 from class_ids import targetClass2id
@@ -23,11 +24,20 @@ from class_ids import targetClass2id
 if __name__ == "__main__":
 	args = get_args()
 
+	"""
 	selects = {
 		"Bike":0.7,
 		"Push_Pulled_Object":0.3,
 		"Prop":0.5,
 		"Door":0.02
+	}
+	"""
+	# select 2
+	selects = {
+		"Bike":1.0,
+		"Push_Pulled_Object":0.3,
+		"Prop":1.0,
+		"Door":0.01
 	}
 
 	videos = [os.path.splitext(os.path.basename(l.strip()))[0] for l in open(args.videolst).readlines()]
@@ -40,6 +50,17 @@ if __name__ == "__main__":
 	ignored_classes = {}
 	for videoname in tqdm(videos,ascii=True):
 		frames = glob(os.path.join(args.annopath, "%s_F_*.npz"%videoname))
+		if args.check_frame is not None:
+			newframes = []
+			for f in frames:
+				filename = os.path.splitext(os.path.basename(f))[0]
+				framefile = os.path.join(args.check_frame, "%s"%videoname, "%s.jpg"%filename)
+				if os.path.exists(framefile):
+					newframes.append(f)
+			if not len(newframes) == len(frames):
+				tqdm.write("%s got %s/%s frames"%(videoname, len(newframes),len(frames)))
+			frames = newframes
+
 		framenames.extend([os.path.splitext(os.path.basename(l))[0] for l in frames])
 
 		# all frame for this video, get all anno

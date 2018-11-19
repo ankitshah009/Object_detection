@@ -1050,10 +1050,6 @@ class Mask_RCNN_FPN():
 		# -> [7,7,256]
 		p23456 = fpn_model(c2345,num_channel=config.fpn_num_channel,scope="fpn")
 
-		if config.obj_v2 or config.obj_v3:
-			p2,p3,p4,p5,p6 = p23456
-			p23456 = [p2,p3,p4,p5]
-
 		# [1, H, W, channel]
 		self.fpn_feature = tf.image.resize_images(tf.transpose(p23456[3],perm=[0,2,3,1]), (7,7)) # p5 # default bilinear
 
@@ -2076,13 +2072,16 @@ class Mask_RCNN_FPN_Act():
 		
 		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,freeze=config.freeze)
 
-		# freeze backbone
-		#c2,c3,c4,c5 = c2345 # c4 will have the most parameter
-		#c2345 = tf.stop_gradient(c2),tf.stop_gradient(c3),tf.stop_gradient(c4),tf.stop_gradient(c5)
-
 
 		# include lateral 1x1 conv and final 3x3 conv
 		p23456 = fpn_model(c2345,num_channel=config.fpn_num_channel,scope="fpn")
+
+		if config.fix_obj_model:
+			p2,p3,p4,p5,p6 = p23456
+			p23456 = [tf.stop_gradient(p2),tf.stop_gradient(p3),tf.stop_gradient(p4),tf.stop_gradient(p5),tf.stop_gradient(p6)]
+
+		# [1, H, W, channel]
+		self.fpn_feature = tf.image.resize_images(tf.transpose(p23456[3],perm=[0,2,3,1]), (7,7)) # p5 # default bilinear
 
 
 		# given the numpy anchor for each stride, 
@@ -2093,7 +2092,8 @@ class Mask_RCNN_FPN_Act():
 		# so we have each fpn level's anchor boxes, and the ground truth anchor boxes & labels if training
 
 		# given [1,256,FS,FS] feature, each level got len(anchor_ratios) anchor outputs
-		rpn_outputs = [self.rpn_head(pi, config.fpn_num_channel, len(config.anchor_ratios), data_format="NCHW",scope="rpn") for pi in p23456]
+		rpn_outputs = [self.rpn_head(pi, config.fpn_num_channel, len(config.anchor_ratios), data_format="NCHW",freeze=config.fix_obj_model,scope="rpn") for pi in p23456]
+
 		multilevel_label_logits = [k[0] for k in rpn_outputs]
 		multilevel_box_logits = [k[1] for k in rpn_outputs]
 
@@ -2116,7 +2116,7 @@ class Mask_RCNN_FPN_Act():
 		# NxCx7x7 # (?, 256, 7, 7)
 		roi_feature_fastrcnn = self.multilevel_roi_align(p23456[:4],rcnn_boxes, 7)
 		# (N,81) ,(N, 80,4)
-		fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_2fc_head(roi_feature_fastrcnn,config.num_class,boxes=rcnn_boxes,scope="fastrcnn")
+		fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_2fc_head(roi_feature_fastrcnn,config.num_class,boxes=rcnn_boxes,freeze=config.fix_obj_model,scope="fastrcnn")
 
 
 		# change from 7 to 14 to get more feature since bigger boxes?
@@ -2252,7 +2252,7 @@ class Mask_RCNN_FPN_Act():
 	# ----some model component
 	# feature map -> [1,1024,FS1,FS2] , FS1 = H/16.0, FS2 = W/16.0
 	# channle -> 1024
-	def rpn_head(self,featuremap, channel, num_anchors, data_format,scope="rpn"):
+	def rpn_head(self,featuremap, channel, num_anchors, data_format,freeze=False, scope="rpn"):
 		with tf.variable_scope(scope):
 			# [1, channel, FS1, FS2] # channel = 1024
 			# conv0:W -> [3,3,1024,1024]
@@ -2273,10 +2273,14 @@ class Mask_RCNN_FPN_Act():
 			# [FS1, FS2,1024,4]
 			box_logits = tf.reshape(box_logits,[box_shape[2], box_shape[3],num_anchors,4])
 
+			if freeze:
+				box_logits = tf.stop_gradient(box_logits)
+				label_logits = tf.stop_gradient(label_logits)
+
 			return label_logits,box_logits
 
 	# feature: [K,C,7,7] # feature for each roi
-	def fastrcnn_2fc_head(self,feature,num_class=None,boxes=None,relation=False, scope="fastrcnn_head"):
+	def fastrcnn_2fc_head(self,feature,num_class=None,boxes=None,relation=False, freeze=False, scope="fastrcnn_head"):
 		config = self.config
 		dim = config.fpn_frcnn_fc_head_dim # 1024
 		initializer = tf.variance_scaling_initializer()
@@ -2310,6 +2314,9 @@ class Mask_RCNN_FPN_Act():
 					box_regression = tf.reshape(box_regression, (-1, num_class-1,4))
 			
 			
+		if freeze:
+			classification = tf.stop_gradient(classification)
+			box_regression = tf.stop_gradient(box_regression)
 
 		return classification,box_regression
 
@@ -2573,7 +2580,11 @@ class Mask_RCNN_FPN_Act():
 			resized_image = batch.data['resized_image'][0]
 		else:
 			resized_image = resizeImage(image,short_edge_size,config.max_size)
+
 		newh,neww = resized_image.shape[:2]
+
+		print newh,neww,batch.data['imgs'][0]
+		sys.exit()
 
 		if is_train:
 			anno = batch.data['gt'][0] # 'boxes' -> [K,4], 'labels' -> [K]

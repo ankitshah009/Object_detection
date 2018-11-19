@@ -62,6 +62,8 @@ def get_args():
 	parser.add_argument("--act_as_obj",action="store_true",help="activity box as obj box")
 
 	parser.add_argument("--add_act",action="store_true",help="add activitiy model")
+
+	parser.add_argument("--fix_obj_model",action="store_true",help="fix the object detection part including rpn")
 	# v1:
 	parser.add_argument("--num_act_class",type=int,default=36,help="num catagory + 1 background")
 	parser.add_argument("--fastrcnn_act_fg_ratio",default=0.25,type=float)
