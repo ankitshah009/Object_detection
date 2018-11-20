@@ -1054,6 +1054,7 @@ class Mask_RCNN_FPN():
 		self.fpn_feature = tf.image.resize_images(tf.transpose(p23456[3],perm=[0,2,3,1]), (7,7)) # p5 # default bilinear
 
 		if config.no_obj_detect: # pair with extract_feat, so only extract feature
+			print "no object detect branch.."
 			return True
 		# given the numpy anchor for each stride, 
 		# slice the anchor box and label against the feature map size on each level. Again?

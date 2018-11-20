@@ -50,6 +50,9 @@ def get_args():
 	parser.add_argument("--feat_path",default=None)
 	parser.add_argument("--just_feat",action="store_true",help="only extract full image feature no bounding box")
 
+	# ---different from above, only feat no object detection
+	parser.add_argument("--videolst",default=None)
+
 	parser.add_argument("--tococo",action="store_true",help="for training in diva using coco model, map diva class1to1 to coco")
 	parser.add_argument("--diva_class",action="store_true",help="the last layer is 16 (full) class output as the diva object classes")
 	#parser.add_argument("--diva_class2",action="store_true",help="the last layer is 16 class output as the diva object classes")
@@ -1410,7 +1413,7 @@ def forward(config):
 				with open(resultfile,"w") as f:
 					json.dump(pred,f)
 
-
+from glob import glob
 # only get fpn backbone feature for each video, no object detection
 def videofeat(config):
 	assert config.feat_path is not None
@@ -1423,14 +1426,16 @@ def videofeat(config):
 	# need videolst
 	# we get all the image first
 	print "getting imglst..."
-	imgs = []
-	for videoname in [os.path.splitext(os.path.basename(l.strip())) for l in open(args.videolst).readlines()]:
+	imgs = {}# videoname -> frames
+	total=0
+	for videoname in [os.path.splitext(os.path.basename(l.strip()))[0] for l in open(config.videolst).readlines()]:
 		framepath = os.path.join(config.imgpath, "%s"%videoname)
 		frames = glob(os.path.join(framepath, "*.jpg"))
 		frames.sort()
 		frames = frames[::config.forward_skip]
-		imgs.extend(frames)
-	print "done, got %s imgs"%len(imgs)
+		imgs[videoname] = frames
+		total+=len(frames)
+	print "done, got %s imgs"%total
 
 
 	#model = get_model(config) # input image -> final_box, final_label, final_masks
@@ -1454,50 +1459,35 @@ def videofeat(config):
 		assert config.num_epochs == 1
 
 		#count=0
-		for images in tqdm(grouper(all_images,config.im_batch_size),ascii=True):
-			images = [im for im in images if im is not None]
-			# multigpu will need full image inpu
-			this_batch_len = len(images)
-			if this_batch_len != config.im_batch_size:
-				need = config.im_batch_size - this_batch_len
-				images.extend(all_images[:need]) # redo some images
-			scales = []
-			resized_images = []
-			ori_shapes = []
-			imagenames = []
-			feed_dict = {}
-			for i,image in enumerate(images):
-				im = cv2.imread(image,cv2.IMREAD_COLOR)
-				imagename = os.path.splitext(os.path.basename(image))[0]
-				imagenames.append(imagename)
+		for videoname in tqdm(imgs,ascii=True):
+			feats = []
+			for images in tqdm(grouper(imgs[videoname],config.im_batch_size),ascii=True):
+				images = [im for im in images if im is not None]
+				# multigpu will need full image inpu
+				this_batch_len = len(images)
+				if this_batch_len != config.im_batch_size:
+					need = config.im_batch_size - this_batch_len
+					images.extend(imgs[videoname][:need]) # redo some images
 
-				ori_shape = im.shape[:2]
+				feed_dict = {}
+				for i,image in enumerate(images):
+					im = cv2.imread(image,cv2.IMREAD_COLOR)
 
-				# need to resize here, otherwise
-				# InvalidArgumentError (see above for traceback): Expected size[1] in [0, 83], but got 120 [[Node: anchors/fm_anchors = Slice[Index=DT_INT32, T=DT_FLOAT, _device="/job:localhost/replica:0/task:0/device:GPU:0"](anchors/all_anchors, anchors/fm_anchors/begin, anchors/stack)]]
+					resized_image = resizeImage(im,config.short_edge_size,config.max_size)
+					
+					feed_dict.update(models[i].get_feed_dict_forward(resized_image))
+				sess_input = []
 
-				resized_image = resizeImage(im,config.short_edge_size,config.max_size)
-
-				scale = (resized_image.shape[0]*1.0/im.shape[0] + resized_image.shape[1]*1.0/im.shape[1])/2.0
-
-				resized_images.append(resized_image)
-				scales.append(scale)
-				ori_shapes.append(ori_shape)
-	
-				feed_dict.update(models[i].get_feed_dict_forward(resized_image))
-
-			sess_input = []
-
-			if config.just_feat:
 				outputs = sess.run(model_feats,feed_dict=feed_dict)
 				for i,feat in enumerate(outputs):
-					imagename = imagenames[i]
 					
-					featfile = os.path.join(config.feat_path, "%s.npy"%imagename)
-					np.save(featfile, feat)
+					feats.append(feat)
 
-				continue # no bounding boxes
-
+			feats = np.array(feats)
+			#(380, 1, 7, 7, 256) 
+			feats = np.squeeze(feats,axis=1)
+			feat_file = os.path.join(config.feat_path,"%s.npy"%videoname)
+			np.save(feat_file, feats)
 
 
 
