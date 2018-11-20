@@ -279,6 +279,10 @@ def get_args():
 
 	args.mrcnn_head_dim = 256
 
+	args.no_obj_detect = False
+	if args.mode == "videofeat":
+		args.no_obj_detect = True
+
 	if args.is_cascade_rcnn:
 		assert args.is_fpn
 		args.cascade_num_stage = 3
@@ -1407,6 +1411,93 @@ def forward(config):
 					json.dump(pred,f)
 
 
+# only get fpn backbone feature for each video, no object detection
+def videofeat(config):
+	assert config.feat_path is not None
+	assert config.is_fpn
+	assert config.videolst is not None
+	if not os.path.exists(config.feat_path):
+		os.makedirs(config.feat_path)
+
+	# imgpath is the frame path,
+	# need videolst
+	# we get all the image first
+	print "getting imglst..."
+	imgs = []
+	for videoname in [os.path.splitext(os.path.basename(l.strip())) for l in open(args.videolst).readlines()]:
+		framepath = os.path.join(config.imgpath, "%s"%videoname)
+		frames = glob(os.path.join(framepath, "*.jpg"))
+		frames.sort()
+		frames = frames[::config.forward_skip]
+		imgs.extend(frames)
+	print "done, got %s imgs"%len(imgs)
+
+
+	#model = get_model(config) # input image -> final_box, final_label, final_masks
+	#tester = Tester(model,config,add_mask=config.add_mask)
+	models = []
+	for i in xrange(config.gpuid_start, config.gpuid_start+config.gpu):
+		models.append(get_model(config,i,controller=config.controller))
+
+	
+	model_feats = [model.fpn_feature for model in models]
+
+	tfconfig = tf.ConfigProto(allow_soft_placement=True)
+	if not config.use_all_mem:
+		tfconfig.gpu_options.allow_growth = True # this way it will only allocate nessasary gpu, not take all
+	# or you can set hard limit
+	#tfconfig.gpu_options.per_process_gpu_memory_fraction = 0.8
+	with tf.Session(config=tfconfig) as sess:
+
+		initialize(load=True,load_best=config.load_best,config=config,sess=sess)
+		# num_epoch should be 1
+		assert config.num_epochs == 1
+
+		#count=0
+		for images in tqdm(grouper(all_images,config.im_batch_size),ascii=True):
+			images = [im for im in images if im is not None]
+			# multigpu will need full image inpu
+			this_batch_len = len(images)
+			if this_batch_len != config.im_batch_size:
+				need = config.im_batch_size - this_batch_len
+				images.extend(all_images[:need]) # redo some images
+			scales = []
+			resized_images = []
+			ori_shapes = []
+			imagenames = []
+			feed_dict = {}
+			for i,image in enumerate(images):
+				im = cv2.imread(image,cv2.IMREAD_COLOR)
+				imagename = os.path.splitext(os.path.basename(image))[0]
+				imagenames.append(imagename)
+
+				ori_shape = im.shape[:2]
+
+				# need to resize here, otherwise
+				# InvalidArgumentError (see above for traceback): Expected size[1] in [0, 83], but got 120 [[Node: anchors/fm_anchors = Slice[Index=DT_INT32, T=DT_FLOAT, _device="/job:localhost/replica:0/task:0/device:GPU:0"](anchors/all_anchors, anchors/fm_anchors/begin, anchors/stack)]]
+
+				resized_image = resizeImage(im,config.short_edge_size,config.max_size)
+
+				scale = (resized_image.shape[0]*1.0/im.shape[0] + resized_image.shape[1]*1.0/im.shape[1])/2.0
+
+				resized_images.append(resized_image)
+				scales.append(scale)
+				ori_shapes.append(ori_shape)
+	
+				feed_dict.update(models[i].get_feed_dict_forward(resized_image))
+
+			sess_input = []
+
+			if config.just_feat:
+				outputs = sess.run(model_feats,feed_dict=feed_dict)
+				for i,feat in enumerate(outputs):
+					imagename = imagenames[i]
+					
+					featfile = os.path.join(config.feat_path, "%s.npy"%imagename)
+					np.save(featfile, feat)
+
+				continue # no bounding boxes
+
 
 
 
@@ -1814,5 +1905,7 @@ if __name__ == "__main__":
 			boxfeat(config)
 		elif config.mode == "givenbox":
 			givenbox(config) # given image, boxes, get the mask output
+		elif config.mode == "videofeat":
+			videofeat(config)
 		else:
 			raise Exception("mode %s not supported"%(config.mode))
