@@ -52,6 +52,7 @@ def get_args():
 
 	# ---different from above, only feat no object detection
 	parser.add_argument("--videolst",default=None)
+	parser.add_argument("--skip",action="store_true",help="skip existing npy")
 
 	parser.add_argument("--tococo",action="store_true",help="for training in diva using coco model, map diva class1to1 to coco")
 	parser.add_argument("--diva_class",action="store_true",help="the last layer is 16 (full) class output as the diva object classes")
@@ -165,6 +166,8 @@ def get_args():
 	parser.add_argument("--frcnn_batch_size",type=int,default=512,help="num roi per image for fastRCNN training")
 	
 	parser.add_argument("--rpn_test_post_nms_topk",type=int,default=700,help="test post nms, input to fast rcnn")
+	# fastrcnn output NMS suppressing iou >= this thresZ
+	parser.add_argument("--fastrcnn_nms_iou_thres",type=float,default=0.5)
 
 	parser.add_argument("--max_size",type=int,default=1333,help="num roi per image for RPN and fastRCNN training")
 	parser.add_argument("--short_edge_size",type=int,default=800,help="num roi per image for RPN and fastRCNN training")
@@ -394,7 +397,7 @@ def get_args():
 		args.rpn_test_pre_nms_topk = 5000
 	#args.rpn_test_post_nms_topk = 700 #1300 # 700 takes 40 hours, # OOM at 1722,28,28,1024 # 800 OOM for gpu4
 	#args.fastrcnn_nms_thres = 0.5
-	args.fastrcnn_nms_iou_thres = 0.5
+	#args.fastrcnn_nms_iou_thres = 0.5 # 0.3?
 
 	args.result_score_thres = 0.0001
 	args.result_per_im = 100 # 400 # 100
@@ -1432,7 +1435,7 @@ def videofeat(config):
 		framepath = os.path.join(config.imgpath, "%s"%videoname)
 		frames = glob(os.path.join(framepath, "*.jpg"))
 		frames.sort()
-		frames = frames[::config.forward_skip]
+		frames = frames[::config.forward_skip] # some only have 1-3 frames
 		imgs[videoname] = frames
 		total+=len(frames)
 	print "done, got %s imgs"%total
@@ -1460,14 +1463,19 @@ def videofeat(config):
 
 		#count=0
 		for videoname in tqdm(imgs,ascii=True):
+			if config.skip:
+				if os.path.exists(os.path.join(config.feat_path,"%s.npy"%videoname)):
+					continue
 			feats = []
 			for images in tqdm(grouper(imgs[videoname],config.im_batch_size),ascii=True):
 				images = [im for im in images if im is not None]
 				# multigpu will need full image inpu
 				this_batch_len = len(images)
+				need=0
 				if this_batch_len != config.im_batch_size:
 					need = config.im_batch_size - this_batch_len
-					images.extend(imgs[videoname][:need]) # redo some images
+					repeats = [imgs[videoname][0] for i in xrange(need)]
+					images.extend(repeats) # redo some images
 
 				feed_dict = {}
 				for i,image in enumerate(images):
@@ -1479,9 +1487,12 @@ def videofeat(config):
 				sess_input = []
 
 				outputs = sess.run(model_feats,feed_dict=feed_dict)
-				for i,feat in enumerate(outputs):
+				this_feats = []
+				for i,feat in enumerate(outputs[:len(outputs)-need]): # ignore the repeated ones
 					
-					feats.append(feat)
+					this_feats.append(feat)
+				assert len(this_feats) == this_batch_len
+				feats.extend(this_feats)
 
 			feats = np.array(feats)
 			#(380, 1, 7, 7, 256) 
