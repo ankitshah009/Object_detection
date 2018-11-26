@@ -39,6 +39,10 @@ def get_args():
 
 	parser.add_argument("--train_skip",type=int,default=1,help="when load diva train set, skip how many.")
 	parser.add_argument("--train_skip_offset",type=int,default=0,help="when load diva train set, offset before skip")
+
+	parser.add_argument("--val_skip",type=int,default=1,help="when load diva val set, skip how many.")
+	parser.add_argument("--val_skip_offset",type=int,default=0,help="when load diva train set, offset before skip")
+
 	parser.add_argument("--forward_skip",type=int,default=1,help="forward, skip how many.")
 
 	parser.add_argument("--modelname",type=str,default=None)
@@ -482,6 +486,11 @@ def read_data_diva(config,idlst,framepath,annopath,tococo=False,randp=None,is_tr
 		ori_num = len(imgs)
 		imgs = imgs[config.train_skip_offset::config.train_skip]
 		print "skipping [%s::%s], got %s/%s"%(config.train_skip_offset,config.train_skip,len(imgs),ori_num)
+	if (config.val_skip > 1) and not is_train:
+		imgs.sort()
+		ori_num = len(imgs)
+		imgs = imgs[config.val_skip_offset::config.val_skip]
+		print "skipping [%s::%s], got %s/%s"%(config.val_skip_offset,config.val_skip,len(imgs),ori_num)
 
 
 	# get starts for each img, the label distribution

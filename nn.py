@@ -663,7 +663,6 @@ def fpn_model(c2345,num_channel,scope):
 			return ret
 
 
-
 	with tf.variable_scope(scope):
 		# each conv feature go through 1x1 conv, then add to 2x upsampled feature, then add 3x3 conv to get final feature
 		lat_2345 = [conv2d(c, num_channel, 1, stride=1, activation=tf.identity, padding='SAME',scope="lateral_1x1_c%s"%(i+2),use_bias=True,data_format="NCHW",W_init=tf.variance_scaling_initializer(scale=1.0)) for i,c in enumerate(c2345)]

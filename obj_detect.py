@@ -17,7 +17,8 @@ import pycocotools.mask as cocomask
 
 from utils import Dataset,Summary,get_op_tensor_name
 
-from class_ids import targetClass2id
+from class_ids import targetClass2id_mergeProp
+targetClass2id = targetClass2id_mergeProp
 
 targetid2class = {targetClass2id[one]:one for one in targetClass2id}
 
@@ -39,6 +40,7 @@ def get_args():
 	parser.add_argument("--gpu",default=1,type=int,help="number of gpu")
 	parser.add_argument("--gpuid_start",default=0,type=int,help="start of gpu id")
 	parser.add_argument('--im_batch_size',type=int,default=1)
+	parser.add_argument("--use_all_mem",action="store_true")
 
 	# --- for internal visualization
 	parser.add_argument("--visualize",action="store_true")
@@ -47,7 +49,7 @@ def get_args():
 	
 
 	# ----------- model params
-	parser.add_argument("--num_class",type=int,default=16,help="num catagory + 1 background")
+	parser.add_argument("--num_class",type=int,default=17,help="num catagory + 1 background")
 
 	parser.add_argument("--model_path",default="/app/object_detection_model")
 
@@ -85,6 +87,8 @@ def get_args():
 	assert len(targetClass2id) == args.num_class
 
 	# ---------------more defautls
+	args.freeze = 2
+	args.no_obj_detect = False
 	args.diva_class = True
 	args.add_mask = False
 	args.is_fpn = True
@@ -202,7 +206,8 @@ if __name__ == "__main__":
 	model = get_model(args,args.gpuid_start,controller=args.controller)
 
 	tfconfig = tf.ConfigProto(allow_soft_placement=True)
-	tfconfig.gpu_options.allow_growth = True
+	if not args.use_all_mem:
+		tfconfig.gpu_options.allow_growth = True
 	tfconfig.gpu_options.visible_device_list = "%s"%(",".join(["%s"%i for i in range(args.gpuid_start, args.gpuid_start+args.gpu)]))
 
 	with tf.Session(config=tfconfig) as sess:
@@ -234,6 +239,7 @@ if __name__ == "__main__":
 
 			# 3. read frame one by one
 			cur_frame=0
+			vis_count=0
 			frame_stack = []
 			while cur_frame < frame_count:
 				suc, frame = vcap.read()
@@ -300,8 +306,9 @@ if __name__ == "__main__":
 					vis_labels = ["%s_%.2f"%(targetid2class[cat_id],prob) for cat_id,prob in zip(final_labels,final_probs)]
 					newim = draw_boxes(im,vis_boxes,vis_labels, color=np.array([255,0,0]),font_scale=0.5,thickness=2)
 
-					vis_file = os.path.join(vis_path,"%s_F_%08d.jpg"%(videoname,cur_frame))
+					vis_file = os.path.join(vis_path,"%s_F_%08d.jpg"%(videoname,vis_count))
 					cv2.imwrite(vis_file, newim)
+					vis_count+=1
 
 				cur_frame+=1
 
