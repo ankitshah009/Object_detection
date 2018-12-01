@@ -54,6 +54,10 @@ def get_args():
 	parser.add_argument("--feat_path",default=None)
 	parser.add_argument("--just_feat",action="store_true",help="only extract full image feature no bounding box")
 
+	# ------ do object detection and extract the fpn feature for each *final* boxes
+	parser.add_argument("--get_box_feat",action="store_true")
+	parser.add_argument("--box_feat_path",default=None)
+
 	# ---different from above, only feat no object detection
 	parser.add_argument("--videolst",default=None)
 	parser.add_argument("--skip",action="store_true",help="skip existing npy")
@@ -101,6 +105,7 @@ def get_args():
 	parser.add_argument("--resnet152",action="store_true",help="")
 
 	parser.add_argument("--is_fpn",action="store_true")
+	parser.add_argument("--obj_v2",action="store_true")
 
 	parser.add_argument("--fpn_frcnn_fc_head_dim",type=int,default=1024)
 	parser.add_argument("--fpn_num_channel",type=int,default=256)
@@ -163,13 +168,11 @@ def get_args():
 	
 	# ----------------------------------training detail
 	parser.add_argument("--use_all_mem",action="store_true")
-	parser.add_argument("--obj_v2",action="store_true")
-	parser.add_argument("--obj_v3",action="store_true")
 	parser.add_argument('--im_batch_size',type=int,default=1)
 	parser.add_argument("--rpn_batch_size",type=int,default=256,help="num roi per image for RPN  training")
 	parser.add_argument("--frcnn_batch_size",type=int,default=512,help="num roi per image for fastRCNN training")
 	
-	parser.add_argument("--rpn_test_post_nms_topk",type=int,default=700,help="test post nms, input to fast rcnn")
+	parser.add_argument("--rpn_test_post_nms_topk",type=int,default=1000,help="test post nms, input to fast rcnn")
 	# fastrcnn output NMS suppressing iou >= this thresZ
 	parser.add_argument("--fastrcnn_nms_iou_thres",type=float,default=0.5)
 
@@ -303,14 +306,10 @@ def get_args():
 
 	if args.is_fpn:
 		args.anchor_strides = (4, 8, 16, 32, 64)
-		if args.obj_v2 or args.obj_v3:
+		if args.obj_v2:
 			args.anchor_strides = (4, 8, 16, 32)
 
 		args.fpn_resolution_requirement = float(args.anchor_strides[3]) # [3] is 32, since we build FPN with r2,3,4,5?
-
-		if args.finer_resolution:
-			args.anchor_strides = (2, 4, 8, 16, 32)
-			args.fpn_resolution_requirement = float(args.anchor_strides[4])
 
 		
 		args.max_size = np.ceil(args.max_size / args.fpn_resolution_requirement) * args.fpn_resolution_requirement
@@ -346,15 +345,13 @@ def get_args():
 	#args.max_size = 1333
 
 	args.anchor_stride = 16 # has to be 16 to match the image feature total stride
-	args.anchor_sizes = (32,64,128,256,512)
-	if args.obj_v2 or args.obj_v3:
-		#args.anchor_sizes = (32,64,128,256)
-		args.anchor_sizes = (16,32,64,128)
+	args.anchor_sizes = (32, 64, 128, 256, 512)
+
+	if args.obj_v2:
+		args.anchor_sizes = (32, 64, 128, 256)
+
 	if args.small_anchor_exp:
 		args.anchor_sizes = (16, 32, 64, 96,128, 256) # not used for fpn
-	if args.finer_resolution:
-		args.anchor_sizes = (16, 32, 64, 128, 256)
-
 
 
 	args.anchor_ratios = (0.5, 1, 2)
@@ -377,36 +374,25 @@ def get_args():
 
 	args.rpn_train_pre_nms_topk = 12000 # not used in fpn
 	args.rpn_train_post_nms_topk = 2000# this is used for fpn_nms_pre
-	if args.obj_v2:
-		args.rpn_train_post_nms_topk = 3000
-	if args.obj_v3:
-		args.rpn_train_post_nms_topk = 1000
 
 
 	# fastrcnn
 	args.fastrcnn_batch_per_im = args.frcnn_batch_size
 	args.fastrcnn_bbox_reg_weights = np.array([10, 10, 5, 5], dtype='float32')
-	if args.obj_v2:
-		args.fastrcnn_bbox_reg_weights = np.array([20, 20, 10, 10], dtype='float32')
-	if args.obj_v3:
-		args.fastrcnn_bbox_reg_weights = np.array([1, 1, 1, 1], dtype='float32')
+	#args.fastrcnn_bbox_reg_weights = np.array([20, 20, 10, 10], dtype='float32')
+
 	args.fastrcnn_fg_thres = 0.5 # iou thres
 	#args.fastrcnn_fg_ratio = 0.25 # 1:3 -> pos:neg
 
 	# testing
 	args.rpn_test_pre_nms_topk = 6000
-	if args.obj_v2:
-		args.rpn_test_pre_nms_topk = 10000
-	if args.obj_v3:
-		args.rpn_test_pre_nms_topk = 5000
+
 	#args.rpn_test_post_nms_topk = 700 #1300 # 700 takes 40 hours, # OOM at 1722,28,28,1024 # 800 OOM for gpu4
 	#args.fastrcnn_nms_thres = 0.5
 	#args.fastrcnn_nms_iou_thres = 0.5 # 0.3?
 
 	args.result_score_thres = 0.0001
 	args.result_per_im = 100 # 400 # 100
-	if args.obj_v2 or args.obj_v3:
-		args.result_per_im = 200
 
 	return args
 

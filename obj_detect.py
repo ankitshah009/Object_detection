@@ -29,12 +29,15 @@ def get_args():
 	parser.add_argument("--video_dir",default=None)
 	parser.add_argument("--video_lst_file",default=None,help="video_file_path = os.path.join(video_dir, $line)")
 
-	parser.add_argument("--out_dir",default=None,help="out_dir/$videoname_F_%%08d.json, start from 0 index")
+	parser.add_argument("--out_dir",default=None,help="out_dir/$videoname.mp4/%%d.json, start from 0 index")
 
 	parser.add_argument("--frame_gap",default=8, type=int)
 
 	parser.add_argument("--threshold_conf",default=0.0001,type=float)
 
+	# ------ for box feature extraction
+	parser.add_argument("--get_box_feat",action="store_true",help="this will generate (num_box, 256, 7, 7) tensor for each frame")
+	parser.add_argument("--box_feat_path",default=None,help="output will be out_dir/$videoname.mp4/%%d.npy, start from 0 index")
 
 	# ---- gpu params
 	parser.add_argument("--gpu",default=1,type=int,help="number of gpu")
@@ -61,6 +64,10 @@ def get_args():
 	parser.add_argument("--max_size",type=int,default=1920,help="num roi per image for RPN and fastRCNN training")
 	parser.add_argument("--short_edge_size",type=int,default=1080,help="num roi per image for RPN and fastRCNN training")
 
+	# ---- tempory: for activity detection model
+	parser.add_argument("--actasobj",action="store_true")
+	parser.add_argument("--actmodel_path",default="/app/activity_detection_model")
+
 
 	# --------------- exp junk
 	parser.add_argument("--obj_v2",action="store_true")
@@ -84,7 +91,12 @@ def get_args():
 	targetid2class = targetid2class
 	targetClass2id = targetClass2id
 
-	assert len(targetClass2id) == args.num_class
+	if args.actasobj:
+		from class_ids import targetAct2id
+		targetClass2id = targetAct2id
+		targetid2class = {targetAct2id[one]:one for one in targetAct2id}
+
+	assert len(targetClass2id) == args.num_class, (len(targetClass2id), args.num_class)
 
 	# ---------------more defautls
 	args.freeze = 2
@@ -171,8 +183,14 @@ def check_args(args):
 	assert args.video_dir is not None
 	assert args.video_lst_file is not None
 	assert args.frame_gap >=1
+	if args.get_box_feat:
+		assert args.box_feat_path is not None
+		if not os.path.exists(args.box_feat_path):
+			os.makedirs(args.box_feat_path)
 	print "cv2 version %s"%(cv2.__version__)
 
+
+# not used, not implemented yet
 def load_models(config):
 	models = []
 	for i in xrange(config.gpuid_start, config.gpuid_start+config.gpu):
@@ -228,6 +246,11 @@ if __name__ == "__main__":
 			video_out_path = os.path.join(args.out_dir, videoname)
 			if not os.path.exists(video_out_path):
 				os.makedirs(video_out_path)
+			# for box feature
+			if args.get_box_feat:
+				feat_out_path = os.path.join(args.box_feat_path, videoname)
+				if not os.path.exists(feat_out_path):
+					os.makedirs(feat_out_path)
 			#frame_width = vcap.get(cv2.cv.CV_CAP_PROP_FRAME_WIDTH)
 			#frame_height = vcap.get(cv2.cv.CV_CAP_PROP_FRAME_HEIGHT)
 			#fps = vcap.get(cv2.cv.CV_CAP_PROP_FPS)
@@ -263,9 +286,19 @@ if __name__ == "__main__":
 
 				feed_dict = model.get_feed_dict_forward(resized_image)
 
-				sess_input = [model.final_boxes, model.final_labels, model.final_probs]
+				if args.get_box_feat:
+					sess_input = [model.final_boxes, model.final_labels, model.final_probs, model.fpn_box_feat]
 
-				final_boxes, final_labels, final_probs = sess.run(sess_input,feed_dict=feed_dict)
+					final_boxes, final_labels, final_probs,box_feats = sess.run(sess_input,feed_dict=feed_dict)
+					assert len(box_feats) == len(final_boxes)
+					# save the box feature first
+
+					featfile = os.path.join(feat_out_path, "%d.npy"%(cur_frame))
+					np.save(featfile, box_feats)
+				else:
+					sess_input = [model.final_boxes, model.final_labels, model.final_probs]
+
+					final_boxes, final_labels, final_probs = sess.run(sess_input,feed_dict=feed_dict)
 				#print "sess run done"
 				# scale back the box to original image size
 				final_boxes = final_boxes / scale

@@ -80,6 +80,729 @@ def get_model_givenbox(config,reuse=False):
 
 	return model
 
+class Mask_RCNN():
+	def __init__(self,config):
+
+		# for batch_norm
+		global is_training
+		is_training = config.is_train # change this before building model
+
+		self.config = config
+
+		self.num_class = config.num_class
+
+		self.global_step = tf.get_variable("global_step",shape=[],dtype='int32',initializer=tf.constant_initializer(0),trainable=False)
+
+		# current model get one image at a time
+		self.image = tf.placeholder(tf.float32,[None, None, 3],name="image")
+		# used for dropout switch
+		self.is_train = tf.placeholder("bool",[],name='is_train')
+
+		# for training
+		self.anchor_labels = tf.placeholder(tf.int32,[None, None, config.num_anchors],name="anchor_labels")
+		self.anchor_boxes = tf.placeholder(tf.float32,[None, None, config.num_anchors,4],name="anchor_boxes")
+		self.gt_boxes = tf.placeholder(tf.float32,[None, 4],name="gt_boxes")
+		self.gt_labels = tf.placeholder(tf.int64,[None,],name="gt_labels")
+
+		self.gt_mask = tf.placeholder(tf.uint8,[None, None, None],name="gt_masks") # H,W,v -> {0,1}
+
+		# the following will be added in the build_forward and loss
+		self.logits = None
+		self.yp = None
+		self.loss = None
+
+		self.build_preprocess()
+		self.build_forward()
+
+
+	# get feature map anchor and preprocess image
+	def build_preprocess(self):
+		config = self.config
+		image = self.image
+
+		# get feature map anchors first
+		# slower if put on cpu # 1.5it/s vs 1.2it/s
+		with tf.name_scope("anchors"):#,tf.device("/cpu:0"):
+			fm_h,fm_w = tf.shape(image)[0] // config.anchor_stride,tf.shape(image)[1] // config.anchor_stride
+
+			# all posible anchor box coordinates for a given max_size image,
+			# so for 1920 x 1920 image, 1290/16 = 120, so (120,120,NA,4) box, NA is scale*ratio boxes
+			all_anchors_np = get_all_anchors(stride=config.anchor_stride,sizes=config.anchor_sizes,ratios=config.anchor_ratios,max_size=config.max_size) 
+			all_anchors = tf.constant(all_anchors_np, name="all_anchors",dtype=tf.float32)
+			# get the anchor in this image with size different than (1920,1920)
+			fm_anchors = tf.slice(all_anchors, [0,0,0,0], tf.stack([fm_h,fm_w,-1,-1]),name="fm_anchors")
+			self.fm_anchors = fm_anchors
+
+		bgr = True # cv2 load image is bgr
+		p_image = tf.expand_dims(image,0) #[1,H,W,C]
+		#print image.get_shape()
+		#sys.exit()
+		with tf.name_scope("image_preprocess"):#,tf.device("/cpu:0"):
+			if p_image.dtype.base_dtype != tf.float32:
+				p_image = tf.cast(p_image,tf.float32)
+
+			
+			mean = [0.485, 0.456, 0.406]
+			std = [0.229, 0.224, 0.225]
+			p_image = p_image*(1.0/255)
+
+
+			if bgr:
+				mean = mean[::-1]
+				std = std[::-1]
+			image_mean = tf.constant(mean, dtype=tf.float32)
+			image_std = tf.constant(std,dtype=tf.float32)
+			p_image = (p_image - image_mean) / image_std
+			p_image = tf.transpose(p_image,[0, 3, 1, 2])
+		self.p_image = p_image
+		
+
+	def build_forward(self):
+		config = self.config
+		image = self.p_image # [1, C, H, W]
+		image_shape2d = tf.shape(image)[2:]
+		# full anchor is [120,120,num_achors,4]  for (1920,1920) image with anchor stride 16,
+		fm_anchors = self.fm_anchors # [FS,FS,num_anchors,4] # all posible anchor position for this image
+
+		# the feature map shared by RPN and fast RCNN
+		# TODO: fix the batch norm mess 
+		# TODO: fix global param like data_format and 
+		# [1,C,FS,FS]
+		featuremap = pretrained_resnet_conv4(image, config.resnet_num_block[:3],tf_pad_reverse=config.new_tensorpack_model)
+
+		# freeze backbone
+		featuremap = tf.stop_gradient(featuremap)
+
+		# feat -> [1,1024,image_h/16,image_w/16]
+		#self.featuremap = featuremap
+
+		# given the feature map, predict each anchor box regression (t_x,y,w,h) and label
+		# [FS,FS,num_anchors,4]
+		# rpn predict each anchor's regression target
+		rpn_label_logits, rpn_box_logits = self.rpn_head(featuremap,1024,config.num_anchors,data_format="NCHW",scope="rpn")
+		#self.rpn_box_logits = rpn_box_logits
+
+		# [FS, FS, num_anchors, 4]
+		# given the regression target t_ logits, get the real predicted box
+		decoded_boxes = decode_bbox_target(rpn_box_logits, fm_anchors,decode_clip=config.bbox_decode_clip)
+
+		# given all the predicted anchor boxes, get region proposal boxes
+		# reshape box and logits to [All,4],[All]
+		# do NMS since boxes are regressed from all anchors, there will be alot of overlap
+		proposal_boxes, proposal_score = generate_rpn_proposals(tf.reshape(decoded_boxes, [-1,4]),tf.reshape(rpn_label_logits, [-1]), image_shape2d, config)
+
+		#self.proposal_boxes = proposal_boxes
+
+		if config.is_train:
+			gt_boxes = self.gt_boxes
+			gt_labels = self.gt_labels
+			# for training, use gt_box and some proposal box as pos and neg
+			# rcnn_sampled_boxes [N_FG+N_NEG,4]
+			# fg_inds_wrt_gt -> [N_FG], each is index of gt_boxes
+			rcnn_sampled_boxes, rcnn_labels, fg_inds_wrt_gt = sample_fast_rcnn_targets(proposal_boxes, gt_boxes,gt_labels,config=config)
+
+			proposal_boxes = rcnn_sampled_boxes
+		
+		# testing use all proposal boxes
+		# [K,4] # training: [N_FG+N_NEG ,4]
+		boxes_on_featuremap = proposal_boxes * (1.0 / config.anchor_stride)
+
+		# given the boxes, get the fixed size features for eachbox
+		# the feature is [1,1024,image_h/16,image_w/16], crop box from this feature, and then resize to a fix size as the feature for each box
+		# [K,C,14,14]# training: [N_FG+N_NEG ,C,14,14]
+		roi_resized = roi_align(featuremap,boxes_on_featuremap,14)
+
+		# given the roi feature, classify each box using the fastrcnn_head
+		
+		# the following may fail due to zero box proposal? fixed at https://github.com/tensorflow/tensorflow/issues/14657
+		"""
+		# [K,1024,14,14] -> [K,2048,7,7] K = N_FG+N_NEG on training
+		feature_fastrcnn = resnet_conv5(roi_resized,config.resnet_num_block[-1])
+		# get roi -> prediction, regression
+		# [K,num_class], [K,num_class-1,4] # training: K  = N_FG + N_NEG
+		# so there should be background box, fastrcnn predict num_class and background
+		# but for box regression only num_class -1
+		fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_head(feature_fastrcnn,config.num_class,scope="fastrcnn")
+		"""
+		# tf 1.4.1 still not working # tf1.6 works
+		def ff_true():
+			feature_fastrcnn = resnet_conv5(roi_resized,config.resnet_num_block[-1],tf_pad_reverse=config.new_tensorpack_model)
+			fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_head(feature_fastrcnn,config.num_class,scope="fastrcnn")
+			return feature_fastrcnn,fastrcnn_label_logits, fastrcnn_box_logits
+		def ff_false():
+			ncls = config.num_class
+			return tf.zeros([0, 2048, 7, 7]), tf.zeros([0, ncls]), tf.zeros([0, ncls - 1, 4])
+
+		feature_fastrcnn, fastrcnn_label_logits, fastrcnn_box_logits = tf.cond(
+			tf.size(boxes_on_featuremap) > 0, ff_true, ff_false)
+		# note fastrcnn_box_logit is [K,num_class -1, 4], other is num_class
+
+		#self.fastrcnn_box_logits = fastrcnn_box_logits
+
+		if config.is_train:
+			# rcnn_labels [N_FG + N_NEG] <- index in [N_FG]
+			fg_inds_wrt_sample = tf.reshape(tf.where(rcnn_labels > 0), [-1])
+
+			# for training, maskRCNN only apply on positive box
+			#  [N_FG, 2048, 7, 7]
+			fg_feature = tf.gather(feature_fastrcnn, fg_inds_wrt_sample)
+			# [N_FG, num_class, 14, 14]
+			
+
+			# ----------------------------------- loss
+			# use input
+			# anchor_boxes, anchor_labels, gt_boxes, gt_labels
+
+			anchor_boxes = self.anchor_boxes
+			anchor_labels = self.anchor_labels
+
+			# get the gt T_xywh
+			anchor_boxes_encoded = encode_bbox_target(anchor_boxes, fm_anchors)
+
+			rpn_label_loss, rpn_box_loss = self.rpn_losses(anchor_labels, anchor_boxes_encoded, rpn_label_logits, rpn_box_logits)
+
+			# [N_FG, 4]
+			# sampled boxes are at least iou with a gt_boxes
+			fg_sampled_boxes = tf.gather(rcnn_sampled_boxes, fg_inds_wrt_sample)
+
+			# [N_FG, 4] # each proposal box assigned gt box, may repeat
+			matched_gt_boxes = tf.gather(gt_boxes, fg_inds_wrt_gt)
+
+			# fastrcnn also need to regress box (just the FG box)
+			encoded_boxes = encode_bbox_target(matched_gt_boxes, fg_sampled_boxes) * tf.constant(config.fastrcnn_bbox_reg_weights) #[10,10,5,5]?
+
+			# fastrcnn input is fg and bg proposal box, do classification to num_class(include bg) and then regress on fg boxes
+			# [N_FG+N_NEG,4] & [N_FG,4]
+			fastrcnn_label_loss, fastrcnn_box_loss = self.fastrcnn_losses(rcnn_labels, fastrcnn_label_logits,encoded_boxes, tf.gather(fastrcnn_box_logits, fg_inds_wrt_sample))
+
+			# for debug
+			self.rpn_label_loss = rpn_label_loss
+			self.rpn_box_loss = rpn_box_loss
+			self.fastrcnn_label_loss = fastrcnn_label_loss
+			self.fastrcnn_box_loss = fastrcnn_box_loss
+
+			losses = [rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss]
+
+			# mask rcnn loss
+			if config.add_mask:
+				mask_logits = self.maskrcnn_head(fg_feature, config.num_class,scope='maskrcnn')
+				# [N_FG, H,W]
+				gt_mask = self.gt_mask
+				gt_mask_for_fg = tf.gather(gt_mask,fg_inds_wrt_gt)
+				# [N_FG, H, W] -> [N_FG, 14, 14]
+				target_masks_for_fg = crop_and_resize(tf.expand_dims(gt_masks_for_fg,1), fg_sampled_boxes,tf.range(tf.size(fg_inds_wrt_gt)), 14)
+				target_masks_for_fg = tf.squeeze(target_masks_for_fg,1)
+
+				mrcnn_loss = self.maskrcnn_loss(mask_logits, fg_labels, target_masks_for_fg)
+
+				losses+=[mrcnn_loss]
+
+			if config.wd is not None:
+				wd = wd_cost('.*/W', config.wd,scope="wd_cost")
+				losses.append(wd)
+
+			self.loss = tf.add_n(losses,'total_loss')
+
+			# l2loss
+		else:
+			# inferencing
+			# K -> proposal box
+			# [K,num_class]
+			 
+			label_probs = tf.nn.softmax(fastrcnn_label_logits)
+			# get the regressed actual boxes
+			# anchor box [K,4] -> [K,num_class - 1, 4] <- box regress logits [K,num_class-1,4]
+			anchors = tf.tile(tf.expand_dims(proposal_boxes,1),[1, config.num_class-1,1])
+			decoded_boxes = decode_bbox_target(fastrcnn_box_logits / tf.constant(config.fastrcnn_bbox_reg_weights,dtype=tf.float32), anchors)
+			decoded_boxes = clip_boxes(decoded_boxes, image_shape2d, name="fastrcnn_all_boxes")
+			#self.decoded_boxes = decoded_boxes
+
+			# decoded boxes are [K,num_class-1,4]. so from each proposal boxes generate all classses' boxes, with prob, then do nms on these
+			# pred_indices: [R,2] , each entry (#proposal[1-K], #catid [0,num_class-1])
+			# final_probs [R]
+			# here do nms,
+			pred_indices, final_probs = self.fastrcnn_predictions(decoded_boxes, label_probs)
+			# [R,4]
+			final_boxes = tf.gather_nd(decoded_boxes, pred_indices, name="final_boxes")
+			# [R] , each is 1-80 catogory
+			final_labels = tf.add(pred_indices[:,1],1,name="final_labels")
+
+			if config.add_mask:
+				def f1():
+					# get mask prediction
+					# use the final box
+					roi_resized = roi_align(featuremap, final_boxes*(1.0/config.anchor_stride),14)
+					feature_maskrcnn = resnet_conv5(roi_resized,config.resnet_num_block[-1],reuse=True,tf_pad_reverse=config.new_tensorpack_model)
+					# [R, num_class-1, 14, 14]
+					mask_logits = self.maskrcnn_head(feature_maskrcnn, config.num_class,scope='maskrcnn')
+					# get only the predict class's mask
+					# [num_class-1,2] -> each is (1-R, #label_class)
+					indices = tf.stack([tf.range(tf.size(final_labels)),tf.to_int32(final_labels)-1],axis=1)
+					# [R,14,14]
+					final_mask_logits = tf.gather_nd(mask_logits,indices)
+					final_masks = tf.sigmoid(final_mask_logits)
+					return final_masks
+
+				final_masks = tf.cond(tf.size(final_probs) > 0, f1, lambda: tf.zeros([0, 14, 14]))
+				# [R,14,14]
+				self.final_masks = final_masks
+
+
+			# [R,4]
+			self.final_boxes = final_boxes
+			# [R]
+			self.final_labels = final_labels
+			self.final_probs = final_probs
+			
+
+	# ----some model component
+	# feature map -> [1,1024,FS1,FS2] , FS1 = H/16.0, FS2 = W/16.0
+	# channle -> 1024
+	def rpn_head(self,featuremap, channel, num_anchors, data_format,scope="rpn"):
+		with tf.variable_scope(scope):
+			# [1, channel, FS1, FS2] # channel = 1024
+			# conv0:W -> [3,3,1024,1024]
+			h = conv2d(featuremap,channel,kernel=3,activation=tf.nn.relu,data_format=data_format,W_init=tf.random_normal_initializer(stddev=0.01),scope="conv0")
+			# h -> [1,1024(channel),FS1,FS2]
+
+			# 1x1 kernel conv to classification on each grid
+			# [1, 1024, FS1, FS2] -> # [1, num_anchors, FS1, FS2]
+			label_logits = conv2d(h,num_anchors,1,data_format=data_format,W_init=tf.random_normal_initializer(stddev=0.01),scope="class")
+			# [1, 1024, FS1, FS2] -> # [1, 4 * num_anchors, FS1, FS2]
+			box_logits = conv2d(h,4*num_anchors,1,data_format=data_format,W_init=tf.random_normal_initializer(stddev=0.01),scope="box")
+
+			# [1,1024,FS1, FS2] -> [FS1, FS2,1024]
+			label_logits = tf.squeeze(tf.transpose(label_logits, [0,2,3,1]),0)
+
+			box_shape = tf.shape(box_logits)
+			box_logits = tf.transpose(box_logits,[0,2,3,1]) # [1,FS1, FS2,1024*4]
+			# [FS1, FS2,1024,4]
+			box_logits = tf.reshape(box_logits,[box_shape[2], box_shape[3],num_anchors,4])
+
+			return label_logits,box_logits
+
+	# feature: [K,2048,7,7] # feature for each roi
+	def fastrcnn_head(self,feature,num_class,scope="fastrcnn_head"):
+		with tf.variable_scope(scope):
+			# [K,2048,7,7] -> [K,2048]
+			# global avg pooling
+			feature = tf.reduce_mean(feature,axis=[2,3],name="output")
+			classification = dense(feature,num_class,W_init=tf.random_normal_initializer(stddev=0.01),scope="class") # [K,num_class]
+			
+
+			if self.config.new_tensorpack_model:
+				box_regression = dense(feature,num_class*4,W_init=tf.random_normal_initializer(stddev=0.001),scope="box")
+				box_regression = tf.reshape(box_regression, (-1, num_class,4))
+
+				box_regression = box_regression[:,1:,:]
+				box_regression.set_shape([None,num_class-1,None])
+			else:
+				box_regression = dense(feature,(num_class -1)*4,W_init=tf.random_normal_initializer(stddev=0.001),scope="box")
+				box_regression = tf.reshape(box_regression, (-1, num_class-1,4))
+			
+			
+
+			return classification,box_regression
+
+	
+	def maskrcnn_head(self,feature,num_class,scope="maskrcnn_head"):
+		with tf.variable_scope(scope):
+			# feature: [K, 2048, 7, 7] # K box
+			# num_class: num_cat + 1 [background]
+			# return: [K, num_cat, 14, 14]
+			l = deconv2d(feature, 256, kernel=2, stride=2, activation=tf.nn.relu,data_format="NCHW",W_init=tf.variance_scaling_initializer(scale=2.0,mode="fan_in",distribution='normal'), scope="deconv")
+			l = conv2d(l,num_class-1,kernel=1,data_format="NCHW",W_init=tf.variance_scaling_initializer(scale=2.0,mode="fan_in",distribution='normal'), scope="conv")
+			return l
+
+	# given all proposal box prediction, based on score thres , get final NMS resulting box
+	# [K,num_class-1,4] -> decoded_boxes
+	# [K,num_class] label_probs
+	# each proposal box has prob and box to all class
+	# here using nms for each class, -> [R]
+	def fastrcnn_predictions(self,boxes, probs,scope="fastrcnn_predictions"):
+		with tf.variable_scope(scope):		
+			config = self.config
+			assert boxes.shape[1] == config.num_class - 1
+			assert probs.shape[1] == config.num_class
+			# transpose to map_fn along each class
+			boxes = tf.transpose(boxes,[1,0,2]) # [num_class-1, K,4]
+			probs = tf.transpose(probs[:,1:],[1,0]) # [num_class-1, K]
+
+			def f(X):
+				prob,box = X # [K], [K,4]
+				output_shape = tf.shape(prob)
+				# [K]
+				ids = tf.reshape(tf.where(prob > config.result_score_thres),[-1])
+				prob = tf.gather(prob,ids)
+				box = tf.gather(box,ids)
+				# NMS
+				selection = tf.image.non_max_suppression(box,prob,max_output_size=config.result_per_im,iou_threshold=config.fastrcnn_nms_iou_thres)
+				selection = tf.to_int32(tf.gather(ids,selection))
+				sorted_selection = -tf.nn.top_k(-selection, k=tf.size(selection))[0]
+
+				mask = tf.sparse_to_dense(sparse_indices=sorted_selection,output_shape=output_shape,sparse_values=True,default_value=False)
+				return mask
+
+			# for each catagory get the top K
+			# [num_class-1, R]
+			masks = tf.map_fn(f, (probs,boxes), dtype=tf.bool, parallel_iterations=10)
+			# [R,2], each entry is [cat_id,box_id]
+			selected_indices = tf.where(masks)
+
+			probs = tf.boolean_mask(probs,masks)# [num_class-1, K] 
+
+			# topk_indices [num_class-1,result_num]
+			topk_probs, topk_indices = tf.nn.top_k(probs, tf.minimum(config.result_per_im,tf.size(probs)),sorted=False)
+
+			# [K,2] <- select [act_num,R] 
+			filtered_selection = tf.gather(selected_indices, topk_indices)
+			filtered_selection = tf.reverse(filtered_selection, axis=[1],name="filtered")
+
+			# [R,2], [R,]
+			return filtered_selection, topk_probs
+
+
+
+
+
+	# ---- losses
+	def maskrcnn_loss(self,mask_logits, fg_labels, fg_target_masks,scope="maskrcnn_loss"):
+		with tf.variable_scope(scope):
+			# mask_logits: [N_FG, num_cat, 14, 14]
+			# fg_labels: [N_FG]
+			# fg_target_masks: [N_FG, 14, 14]
+			num_fg = tf.size(fg_labels)
+			# [N_FG, 2] # these index is used to get the pos cat's logit
+			indices = tf.stack([tf.range(num_fg),tf.to_int32(fg_labels) - 1],axis=1)
+			# ignore other class's logit
+			# [N_FG, 14, 14]
+			mask_logits = tf.gather_nd(mask_logits, indices)
+			mask_probs = tf.sigmoid(mask_logits)
+
+			loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=fg_target_masks, logits=mask_logits)
+			loss = tf.reduce_mean(loss, name='maskrcnn_loss')
+
+			return loss
+
+
+	def rpn_losses(self, anchor_labels, anchor_boxes, label_logits, box_logits,scope="rpn_losses"):
+		config = self.config
+		with tf.variable_scope(scope):
+			# anchor_label ~ {-1,0,1} , -1 means ignore, , 0 neg, 1 pos
+			# label_logits [FS,FS,num_anchors] [7,7,1024]
+			# box_logits [FS,FS,num_anchors,4] [7.7,1024,4]
+			
+			#with tf.device("/cpu:0"):
+			valid_mask = tf.stop_gradient(tf.not_equal(anchor_labels, -1)) # 1,0|pos/neg
+			pos_mask = tf.stop_gradient(tf.equal(anchor_labels, 1))
+			nr_valid = tf.stop_gradient(tf.count_nonzero(valid_mask, dtype=tf.int32), name="num_valid_anchor")
+			nr_pos = tf.count_nonzero(pos_mask,dtype=tf.int32, name="num_pos_anchor")
+
+			# [K1]
+
+			valid_anchor_labels = tf.boolean_mask(anchor_labels,valid_mask)
+
+			# [K2]
+			valid_label_logits = tf.boolean_mask(label_logits, valid_mask)
+
+			# label loss for all valid anchor box
+			if config.focal_loss:
+				label_loss = focal_loss(logits=valid_label_logits,labels=tf.to_float(valid_anchor_labels))
+			else:
+				label_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=valid_label_logits,labels=tf.to_float(valid_anchor_labels))
+
+				label_loss = tf.reduce_mean(label_loss,name="label_loss")
+
+			# box loss for positive anchor
+			pos_anchor_boxes = tf.boolean_mask(anchor_boxes,pos_mask)
+			pos_box_logits = tf.boolean_mask(box_logits,pos_mask)
+
+			delta = 1.0/9
+
+			# the smooth l1 loss
+			box_loss = tf.losses.huber_loss(pos_anchor_boxes, pos_box_logits, delta=delta, reduction=tf.losses.Reduction.SUM) / delta
+			box_loss = tf.div(box_loss, tf.cast(nr_valid, tf.float32),name='box_loss')
+
+			return label_loss, box_loss
+
+	def fastrcnn_losses(self, labels, label_logits, fg_boxes, fg_box_logits,scope="fastrcnn_losses"):
+		config = self.config
+		with tf.variable_scope(scope):
+			# label -> label for roi [N_FG + N_NEG]
+			# label_logits [N_FG + N_NEG,num_class]
+			# fg_boxes_logits -> [N_FG,num_class-1,4]
+
+			# so the label is int [0-num_class], 0 being background
+
+			if config.focal_loss:
+				onehot_label = tf.one_hot(labels,label_logits.get_shape()[-1])
+
+				# here uses sigmoid
+				label_loss = focal_loss(logits=label_logits,labels=tf.to_float(onehot_label))
+			else:
+				label_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=label_logits)
+
+				label_loss = tf.reduce_mean(label_loss, name="label_loss")
+
+			fg_inds = tf.where(labels > 0)[:,0]
+			fg_labels = tf.gather(labels, fg_inds) # [N_FG]
+
+			num_fg = tf.size(fg_inds) # N_FG
+			# [N_FG, 2]
+			indices = tf.stack([tf.range(num_fg),tf.to_int32(fg_labels) - 1], axis=1)
+			# gather the logits from [N_FG,num_class-1, 4] to [N_FG,4], only the gt class's logit
+			fg_box_logits = tf.gather_nd(fg_box_logits, indices)
+
+			box_loss = tf.losses.huber_loss(fg_boxes, fg_box_logits, reduction=tf.losses.Reduction.SUM)
+
+			# /  N_FG + N_NEG ?
+			box_loss = tf.truediv(box_loss, tf.to_float(tf.shape(labels)[0]),name='box_loss')
+
+			return label_loss, box_loss
+
+
+	# given the image path, and the label for it
+	# preprocess
+	def get_feed_dict(self,batch,is_train=False):
+
+		#{"imgs":[],"gt":[]}
+		config = self.config
+		
+		N = len(batch.data['imgs'])
+
+		assert N == 1 # only 1 image for now
+
+		image = batch.data['imgs'][0]
+
+		feed_dict = {}
+
+		if batch.data.has_key("imgdata"):
+			image = batch.data['imgdata'][0]
+		else:
+			image = cv2.imread(image,cv2.IMREAD_COLOR)
+			assert image is not None,image
+			image = image.astype("float32")
+		h,w = image.shape[:2] # original width/height
+
+		# resize image, boxes
+		short_edge_size = config.short_edge_size
+		if config.scale_jittering:
+			short_edge_size = random.randint(config.short_edge_size_min,config.short_edge_size_max)
+		if batch.data.has_key("resized_image"):
+			resized_image = batch.data['resized_image'][0]
+		else:
+			resized_image = resizeImage(image,short_edge_size,config.max_size)
+		newh,neww = resized_image.shape[:2]
+
+		if is_train:
+			anno = batch.data['gt'][0] # 'boxes' -> [K,4], 'labels' -> [K]
+			o_boxes = anno['boxes'] # now the box is in [x1,y1,x2,y2] format, not coco box
+			labels = anno['labels']
+			assert len(labels) == len(o_boxes)
+
+			# boxes # (x,y,w,h)
+			"""
+			boxes = o_boxes[:,[0,2,1,3]] #(x,w,y,h)
+			boxes = boxes.reshape((-1,2,2)) #
+			boxes[:,0] = boxes[:,0] * (neww*1.0/w) # x,w
+			boxes[:,1] = boxes[:,1] * (newh*1.0/h) # y,h
+			"""
+
+			# boxes # (x1,y1,x2,y2)
+			boxes = o_boxes[:,[0,2,1,3]] #(x1,x2,y1,y2)
+			boxes = boxes.reshape((-1,2,2)) # (x1,x2),(y1,y2)
+			boxes[:,0] = boxes[:,0] * (neww*1.0/w) # x1,x2
+			boxes[:,1] = boxes[:,1] * (newh*1.0/h) # y1,y2
+
+
+			# random horizontal flip
+			# no flip for surveilance video?
+			if config.flip_image:
+				prob = 0.5
+				rand = random.random()
+				if rand > prob:
+					resized_image = cv2.flip(resized_image,1) # 1 for horizontal
+					#boxes[:,0,0] = neww - boxes[:,0,0] - boxes[:,0,1] # for (x,y,w,h)
+					boxes[:,0] = neww - boxes[:,0]
+					boxes[:,0,:] = boxes[:,0,::-1]# (x_min will be x_max after flip)
+				
+
+			boxes = boxes.reshape((-1,4))
+			boxes = boxes[:,[0,2,1,3]] #(x1,y1,x2,y2)
+
+			# conver box to (x1,y1,x2,y2) # updated, no need,
+			#boxes[:,2] = boxes[:,0] + boxes[:,2]
+			#boxes[:,3] = boxes[:,1] + boxes[:,3]
+
+			# visualize?
+			if config.vis_pre:
+				label_names = [config.classId_to_class[i] for i in labels]
+				o_boxes_x1x2 = np.asarray([box_wh_to_x1x2(box) for box in o_boxes])
+				boxes_x1x2 = np.asarray([box for box in boxes])
+				ori_vis = draw_boxes(image,o_boxes_x1x2,labels=label_names)
+				new_vis = draw_boxes(resized_image,boxes_x1x2,labels=label_names)
+				imgname = os.path.splitext(os.path.basename(batch.data['imgs'][0]))[0]
+				cv2.imwrite("%s.ori.jpg"%os.path.join(config.vis_path,imgname),ori_vis)
+				cv2.imwrite("%s.prepro.jpg"%os.path.join(config.vis_path,imgname),new_vis)
+				print "viz saved in %s"%config.vis_path
+				sys.exit()
+
+			# get rpn anchor labels
+			# [fs_im,fs_im,num_anchor,4]
+			try:
+				fm_labels, fm_boxes = self.get_rpn_anchor_input(resized_image, boxes)
+			except Exception as e: # there is no fg_rpn
+				raise e
+
+			assert len(boxes) > 0
+
+			feed_dict[self.anchor_labels] = fm_labels
+			feed_dict[self.anchor_boxes] = fm_boxes
+			feed_dict[self.gt_boxes] = boxes
+			feed_dict[self.gt_labels] = labels
+
+		else:
+			
+			pass
+
+		feed_dict[self.image] = resized_image
+
+		feed_dict[self.is_train] = is_train
+
+		return feed_dict
+
+	def get_feed_dict_forward(self,imgdata):
+		feed_dict = {}
+
+		feed_dict[self.image] = imgdata
+
+		feed_dict[self.is_train] = False
+
+		return feed_dict
+
+	# anchor related function for training--------------------
+
+	def filter_box_inside(self, im, boxes):
+		h, w = im.shape[:2]
+		indices = np.where(
+			(boxes[:,0] >= 0) &
+			(boxes[:,1] >= 0) &
+			(boxes[:,2] <= w) &
+			(boxes[:,3] <= h)  
+		)[0]
+		return indices, boxes[indices,:]
+	# for training, given image and box, get anchor box labels
+	# [fs_im,fs_im,num_anchor,4] # not fs,
+	def get_rpn_anchor_input(self,im,boxes):
+		
+
+		config = self.config
+
+		boxes = boxes.copy()
+
+		# [FS,FS,num_anchor,4] all possible anchor boxes given the max image size
+		all_anchors_np = np.copy(get_all_anchors(stride=config.anchor_stride,sizes=config.anchor_sizes,ratios=config.anchor_ratios,max_size=config.max_size))
+
+		h,w = im.shape[:2]
+
+		# TODO: change this as FPN model
+		# so image may be smaller than the full anchor size
+		featureh,featurew = h//config.anchor_stride,w//config.anchor_stride
+		
+		# [FS_im,FS_im,num_anchors,4] # the anchor field that the image is included
+		featuremap_anchors = all_anchors_np[:featureh,:featurew,:,:]
+		#print featuremap_anchors.shape #(46,83,15,4)
+		featuremap_anchors_flatten = featuremap_anchors.reshape((-1,4))
+
+		#anchorH, anchorW = all_anchors_np.shape[:2]
+		#featureh, featurew = anchorH, anchorW
+		#featuremap_anchors_flatten = all_anchors_np.reshape((-1,4))
+
+		# num_in < FS_im*FS_im*num_anchors # [num_in,4]
+		inside_ind, inside_anchors = self.filter_box_inside(im,featuremap_anchors_flatten) # the anchor box inside the image
+		
+
+		# anchor labels is in {1,-1,0}, -1 means ignore
+		# N = num_in
+		# [N], [N,4] # only the fg anchor has box value
+		anchor_labels,anchor_boxes = self.get_anchor_labels(inside_anchors, boxes)
+
+		# fill back to [fs,fs,num_anchor,4]
+		# all anchor outside box is ignored (-1)
+
+		featuremap_labels = -np.ones((featureh * featurew*config.num_anchors,),dtype='int32')
+		featuremap_labels[inside_ind] = anchor_labels
+		featuremap_labels = featuremap_labels.reshape((featureh,featurew,config.num_anchors))
+
+		featuremap_boxes = np.zeros((featureh * featurew*config.num_anchors,4),dtype='float32')
+		featuremap_boxes[inside_ind,:] = anchor_boxes
+		featuremap_boxes = featuremap_boxes.reshape((featureh,featurew,config.num_anchors,4))
+
+		return featuremap_labels,featuremap_boxes
+
+	def get_anchor_labels(self,anchors,gt_boxes):
+		config = self.config
+
+		# return max_num of index for labels equal val
+		def filter_box_label(labels, val, max_num):
+			cur_inds = np.where(labels == val)[0]
+			if len(cur_inds) > max_num:
+				disable_inds = np.random.choice(cur_inds,size=(len(cur_inds) - max_num),replace=False)
+				labels[disable_inds] = -1
+				cur_inds = np.where(labels == val)[0]
+			return cur_inds
+
+		
+
+		NA,NB = len(anchors),len(gt_boxes)
+		assert NB > 0
+
+		#bbox_iou_float = get_iou_callable() # tf op on cpu, nn.py
+		#box_ious = bbox_iou_float(anchors,gt_boxes) #[NA,NB]
+		box_ious = np_iou(anchors, gt_boxes)
+
+		#print box_ious.shape #(37607,7)
+
+		#NA, each anchors max iou to any gt box, and the max gt box's index [0,NB-1]
+		iou_argmax_per_anchor = box_ious.argmax(axis=1)
+		iou_max_per_anchor = box_ious.max(axis=1)
+
+		# 1 x NB, each gt box's max iou to any anchor boxes
+		#iou_max_per_gt = box_ious.max(axis=1,keepdims=True) 
+		#print iou_max_per_gt # all zero?
+		iou_max_per_gt = np.amax(box_ious, axis=0, keepdims=True)  # 1xNB
+
+		# NA x 1? True for anchors that cover all the gt boxes
+		anchors_with_max_iou_per_gt = np.where(box_ious == iou_max_per_gt)[0]
+
+		anchor_labels = -np.ones((NA,),dtype='int32')
+
+		anchor_labels[anchors_with_max_iou_per_gt] = 1
+		anchor_labels[iou_max_per_anchor >= config.positive_anchor_thres] = 1
+		anchor_labels[iou_max_per_anchor < config.negative_anchor_thres] = 0
+
+		# cap the number of fg anchor and bg anchor
+		target_num_fg = int(config.rpn_batch_per_im * config.rpn_fg_ratio)
+
+		# set the label==1 to -1 if the number exceeds
+		fg_inds = filter_box_label(anchor_labels, 1, target_num_fg)
+
+		#assert len(fg_inds) > 0
+		old_num_bg = np.sum(anchor_labels == 0)
+		if old_num_bg == 0:
+			raise Exception("No valid background for RPN!")
+
+		# the rest of 256 is negative
+		target_num_bg = config.rpn_batch_per_im - len(fg_inds)
+
+		# set some label to -1 if exceeds
+		filter_box_label(anchor_labels,0,target_num_bg)
+
+		# only the fg anchor_boxes are filled with the corresponding gt_box
+		anchor_boxes = np.zeros((NA,4),dtype='float32')
+		anchor_boxes[fg_inds,:] = gt_boxes[iou_argmax_per_anchor[fg_inds],:]
+		return anchor_labels, anchor_boxes
+
 
 class Mask_RCNN_FPN():
 	def __init__(self,config,gpuid=0):
@@ -145,10 +868,11 @@ class Mask_RCNN_FPN():
 			if p_image.dtype.base_dtype != tf.float32:
 				p_image = tf.cast(p_image,tf.float32)
 
+			
 			mean = [0.485, 0.456, 0.406]
 			std = [0.229, 0.224, 0.225]
-
 			p_image = p_image*(1.0/255)
+
 
 			if bgr:
 				mean = mean[::-1]
@@ -213,6 +937,8 @@ class Mask_RCNN_FPN():
 				pred_boxes_decoded = decode_bbox_target(multilevel_box_logits[lvl], anchors,decode_clip=config.bbox_decode_clip)
 
 				this_fpn_nms_topk = fpn_nms_topk
+				if config.obj_v2 and lvl == 0:
+					this_fpn_nms_topk = 4000
 				proposal_boxes, proposal_scores = generate_rpn_proposals(tf.reshape(pred_boxes_decoded, [-1,4]), tf.reshape(multilevel_label_logits[lvl], [-1]), image_shape2d, config,pre_nms_topk=this_fpn_nms_topk)
 				all_boxes.append(proposal_boxes)
 				all_scores.append(proposal_scores)
@@ -317,7 +1043,7 @@ class Mask_RCNN_FPN():
 		# TODO: fix global param like data_format and 
 		# [1,C,FS,FS]
 		
-		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,freeze=config.freeze)
+		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,finer_resolution=config.finer_resolution,freeze=config.freeze)
 		
 
 		# include lateral 1x1 conv and final 3x3 conv
@@ -332,13 +1058,10 @@ class Mask_RCNN_FPN():
 			return True
 		# given the numpy anchor for each stride, 
 		# slice the anchor box and label against the feature map size on each level. Again?
-		
 		self.slice_feature_and_anchors(image_shape2d,p23456,multilevel_anchors)
 		# now multilevel_anchors are sliced and tf type
 		# added sliced gt anchor labels and boxes
 		# so we have each fpn level's anchor boxes, and the ground truth anchor boxes & labels if training
-		if config.obj_v2:
-			p23456 = p23456[:4]
 
 		# given [1,256,FS,FS] feature, each level got len(anchor_ratios) anchor outputs
 		rpn_outputs = [self.rpn_head(pi, config.fpn_num_channel, len(config.anchor_ratios), data_format="NCHW",scope="rpn") for pi in p23456]
@@ -390,8 +1113,10 @@ class Mask_RCNN_FPN():
 			# NxCx7x7 # (?, 256, 7, 7)
 			roi_feature_fastrcnn = self.multilevel_roi_align(p23456[:4],rcnn_boxes, 7)
 			# (N,81) ,(N, 80,4)
-			
-			fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_2fc_head(roi_feature_fastrcnn,config.num_class,boxes=rcnn_boxes,scope="fastrcnn")
+			if config.obj_v2 or config.obj_v3:
+				fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_2fc_head_class_agnostic(roi_feature_fastrcnn,config.num_class,boxes=rcnn_boxes,scope="fastrcnn")
+			else:
+				fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_2fc_head(roi_feature_fastrcnn,config.num_class,boxes=rcnn_boxes,scope="fastrcnn")
 		
 
 		if config.is_train:
@@ -520,8 +1245,13 @@ class Mask_RCNN_FPN():
 				# get the regressed actual boxes
 				# anchor box [K,4] -> [K,num_class - 1, 4] <- box regress logits [K,num_class-1,4]
 				anchors = tf.tile(tf.expand_dims(rcnn_boxes,1),[1, config.num_class-1,1])
+				if config.obj_v2 or config.obj_v3:
+					anchors = tf.expand_dims(rcnn_boxes,1)
 
 				decoded_boxes = decode_bbox_target(fastrcnn_box_logits / tf.constant(config.fastrcnn_bbox_reg_weights,dtype=tf.float32), anchors)
+
+				if config.obj_v2 or config.obj_v3:
+					decoded_boxes = tf.tile(decoded_boxes, [1, config.num_class-1, 1])
 
 				label_probs = tf.nn.softmax(fastrcnn_label_logits)
 
@@ -558,10 +1288,6 @@ class Mask_RCNN_FPN():
 			# [R]
 			self.final_labels = final_labels
 			self.final_probs = final_probs
-
-			if config.get_box_feat:
-				# [R, 256, 7, 7]
-				self.fpn_box_feat = self.multilevel_roi_align(p23456[:4],final_boxes, 7)
 			
 
 	# ----some model component

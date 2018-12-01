@@ -632,8 +632,6 @@ def resnet_fpn_backbone(image, num_blocks,resolution_requirement,tf_pad_reverse=
 		c5 = tf.stop_gradient(c5)
 	## 32x downsampling up to now
 	# size of c5: ceil(input/32)
-	if finer_resolution:
-		return c1,c2,c3,c4
 	return c2,c3,c4,c5
 
 # the FPN model
@@ -895,8 +893,6 @@ def generate_rpn_proposals(boxes, scores, img_shape,config,pre_nms_topk=None): #
 	if pre_nms_topk is not None:
 		post_nms_topk = pre_nms_topk
 	else:
-		# there may be problem for validation during training
-		# no problem, we have two model when training
 		if config.is_train:
 			pre_nms_topk = config.rpn_train_pre_nms_topk
 			post_nms_topk = config.rpn_train_post_nms_topk

@@ -12,6 +12,7 @@ def get_args():
 	parser.add_argument("outpath")
 	parser.add_argument("--not_coco_box",action="store_true")
 	parser.add_argument("--merge_prop",action="store_true",help="this means put all Push_Pulled_Object anno into prop")
+	parser.add_argument("--skip",type=int,default=1)
 	return parser.parse_args()
 
 
@@ -60,21 +61,29 @@ if __name__ == "__main__":
 	args = get_args()
 
 	files = [os.path.splitext(os.path.basename(line.strip()))[0] for line in open(args.filelst,"r").readlines()]
+	files.sort()
+	files = files[::args.skip]
 
 	eval_target = ["Vehicle","Person","Construction_Barrier","Door","Dumpster","Prop","Push_Pulled_Object","Bike","Parking_Meter","Prop_plus_Push_Pulled_Object"]
 	eval_target = {one:1 for one in eval_target}
 
 	e = {one:{} for one in eval_target} # cat_id -> imgid -> {"dm","dscores"}
 
+	count_no_out=0
 	for filename in tqdm(files, ascii=True):
 		gtfile = os.path.join(args.gtpath,"%s.npz"%filename)
 		outfile = os.path.join(args.outpath,"%s.json"%filename)
 
+
 		# load annotation first
 		anno = dict(np.load(gtfile))
 
-		with open(outfile, "r") as f:
-			out = json.load(f)
+		if not os.path.exists(outfile):
+			count_no_out+=1
+			out = []
+		else:
+			with open(outfile, "r") as f:
+				out = json.load(f)
 
 		if args.merge_prop:
 			
@@ -96,6 +105,7 @@ if __name__ == "__main__":
 		gt_boxes = gather_gt(anno['boxes'],anno['labels'],eval_target)
 
 		match_dt_gt(e,filename,target_dt_boxes,gt_boxes,eval_target)
+	print "%s/%s out file not exists"%(count_no_out,len(files))
 	aps,ars = aggregate_eval(e,maxDet=100)
 	aps_str = "|".join(["%s:%.5f"%(class_,aps[class_]) for class_ in aps])
 	ars_str = "|".join(["%s:%.5f"%(class_,ars[class_]) for class_ in ars])
