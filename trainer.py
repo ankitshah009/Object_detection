@@ -7,7 +7,7 @@ import tensorflow as tf
 import sys
 from models import assign_to_device
 
-def average_gradients(tower_grads):
+def average_gradients(tower_grads,sum_grads=False):
 	"""Calculate the average gradient for each shared variable across all towers.
 	Note that this function provides a synchronization point across all towers.
 	Args:
@@ -23,7 +23,10 @@ def average_gradients(tower_grads):
 		# Note that each grad_and_vars looks like the following:
 		#   ((grad0_gpu0, var0_gpu0), ... , (grad0_gpuN, var0_gpuN))
 		grads = [g for g, _ in grad_and_vars]
-		grad = tf.reduce_mean(grads, 0)
+		if sum_grads:
+			grad = tf.reduce_sum(grads, 0)
+		else:
+			grad = tf.reduce_mean(grads, 0)
 
 		# Keep in mind that the Variables are redundant because they are shared
 		# across towers. So .. we will just return the first tower's pointer to
@@ -94,7 +97,7 @@ class Trainer():
 		# apply gradient on the controlling device
 		with tf.device(config.controller):
 			avg_loss = tf.reduce_mean(self.losses)
-			avg_grads = average_gradients(self.grads)
+			avg_grads = average_gradients(self.grads,sum_grads=True)
 
 			self.train_op = self.opt.apply_gradients(avg_grads,global_step=self.global_step)
 			self.loss = avg_loss
