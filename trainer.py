@@ -24,7 +24,8 @@ def average_gradients(tower_grads,sum_grads=False):
 		#   ((grad0_gpu0, var0_gpu0), ... , (grad0_gpuN, var0_gpuN))
 		grads = [g for g, _ in grad_and_vars]
 		if sum_grads:
-			grad = tf.reduce_sum(grads, 0)
+			#grad = tf.reduce_sum(grads, 0)
+			grad = tf.add_n(grads)
 		else:
 			grad = tf.reduce_mean(grads, 0)
 
@@ -32,8 +33,7 @@ def average_gradients(tower_grads,sum_grads=False):
 		# across towers. So .. we will just return the first tower's pointer to
 		# the Variable.
 		v = grad_and_vars[0][1]
-		grad_and_var = (grad, v)
-		average_grads.append(grad_and_var)
+		average_grads.append((grad, v))
 	return average_grads
 
 class Trainer():
