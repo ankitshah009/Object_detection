@@ -18,8 +18,12 @@ def wd_cost(regex,wd,scope):
 	params = tf.trainable_variables()
 	with tf.name_scope(scope):
 		costs = []
+		names = []
 		for p in params:
 			para_name = p.op.name
+			# freeze backbone, temp fix
+			if para_name.startswith("conv0") or para_name.startswith("group0"):
+				continue
 			if re.search(regex, para_name):
 				regloss = tf.multiply(tf.convert_to_tensor(wd, dtype=p.dtype.base_dtype,name="scale"), tf.nn.l2_loss(p), name="%s/wd"%p.op.name)
 				assert regloss.dtype.is_floating, regloss
@@ -28,6 +32,7 @@ def wd_cost(regex,wd,scope):
 				if regloss.dtype != tf.float32:
 					regloss = tf.cast(regloss, tf.float32)
 				costs.append(regloss)
+				names.append(para_name)
 
 		# print the names?
 		print "found %s variables for weight reg"%(len(costs))
