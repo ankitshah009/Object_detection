@@ -21,7 +21,7 @@ def wd_cost(regex,wd,scope):
 		for p in params:
 			para_name = p.op.name
 			if re.search(regex, para_name):
-				regloss = tf.multiply(tf.nn.l2_loss(p), wd, name="%s/wd"%p.op.name)
+				regloss = tf.multiply(tf.convert_to_tensor(wd, dtype=p.dtype.base_dtype,name="scale"), tf.nn.l2_loss(p), name="%s/wd"%p.op.name)
 				assert regloss.dtype.is_floating, regloss
 				# Some variables may not be fp32, but it should
 				# be fine to assume regularization in fp32
@@ -30,9 +30,9 @@ def wd_cost(regex,wd,scope):
 				costs.append(regloss)
 
 		# print the names?
-
-		if not costs:
-			return tf.constant(0, dtype=tf.float32, name=scope)
+		print "found %s variables for weight reg"%(len(costs))
+		if len(costs) == 0:
+			return tf.constant(0, dtype=tf.float32, name="empty_"+scope)
 		else:
 			return tf.add_n(costs,name=scope)
 

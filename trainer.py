@@ -18,6 +18,7 @@ def average_gradients(tower_grads,sum_grads=False):
 			across all towers.
 	"""
 	average_grads = []
+	nr_tower = len(tower_grads)
 	for grad_and_vars in zip(*tower_grads):
 
 		# Note that each grad_and_vars looks like the following:
@@ -27,7 +28,8 @@ def average_gradients(tower_grads,sum_grads=False):
 			#grad = tf.reduce_sum(grads, 0)
 			grad = tf.add_n(grads)
 		else:
-			grad = tf.reduce_mean(grads, 0)
+			grad = tf.multiply(tf.add_n(grads), 1.0 / nr_tower)
+			#grad = tf.reduce_mean(grads, 0)
 
 		# Keep in mind that the Variables are redundant because they are shared
 		# across towers. So .. we will just return the first tower's pointer to
