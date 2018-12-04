@@ -42,6 +42,7 @@ def get_args():
 
 	parser.add_argument("--val_skip",type=int,default=1,help="when load diva val set, skip how many.")
 	parser.add_argument("--val_skip_offset",type=int,default=0,help="when load diva train set, offset before skip")
+	parser.add_argument("--exit_after_val",action="store_true")
 
 	parser.add_argument("--forward_skip",type=int,default=1,help="forward, skip how many.")
 
@@ -911,7 +912,6 @@ def train_diva(config):
 					else:
 						tqdm.write("\tval in %s at step %s, AP:%s, AR:%s, this step val:%.5f, previous best val at %s is %.5f"%(num_val_steps,global_step,aps_str,ars_str,validation_performance,best[1],best[0]))
 
-
 				if validation_performance > best[0]:
 					tqdm.write("\tsaving best model %s..."%global_step)
 					bestsaver.save(sess,os.path.join(config.save_dir_best,"model"),global_step=global_step)
@@ -919,7 +919,10 @@ def train_diva(config):
 					best = (validation_performance,global_step)
 
 				isStart = False
-				
+				if config.exit_after_val:
+					print "exit after eval."
+					break
+
 			# skip if the batch is not complete, usually the last few ones
 			if len(batch[1]) != config.gpu:
 				continue

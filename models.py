@@ -497,7 +497,6 @@ class Mask_RCNN_FPN():
 			# l2loss
 		else:
 
-
 			# inferencing
 			# K -> proposal box
 			# [K,num_class]
