@@ -8,7 +8,7 @@ import sys
 from models import assign_to_device
 
 def average_gradients(tower_grads,sum_grads=False):
-	"""Calculate the average gradient for each shared variable across all towers.
+	"""Calculate the average/summed gradient for each shared variable across all towers.
 	Note that this function provides a synchronization point across all towers.
 	Args:
 	tower_grads: List of lists of (gradient, variable) tuples. The outer list ranges
@@ -44,19 +44,48 @@ class Trainer():
 		self.models = models 
 		self.global_step = models[0].global_step # 
 		
-
 		learning_rate = config.init_lr
 
 		if config.use_lr_decay:
-			decay_steps = int(config.train_num_examples / config.im_batch_size * config.num_epoch_per_decay)
-			print "LR_decay: every %s steps"%decay_steps
-			learning_rate = tf.train.exponential_decay(
-			 	config.init_lr,
-				self.global_step,
-				decay_steps,
-				config.learning_rate_decay,
-				staircase=True
-			)
+						
+			if config.use_cosine_and_warm_up:
+				warm_up_start = config.init_lr * 0.33
+				# linear increasing from 0.33*lr to lr in warm_up_steps
+				warm_up_lr = tf.train.polynomial_decay(
+					warm_up_start,
+					self.global_step,
+					config.warm_up_steps,
+					config.init_lr,
+					power=1.0, 
+				)
+
+				max_steps = int(config.train_num_examples / config.im_batch_size * config.num_epochs)
+				cosine_lr = tf.train.cosine_decay(
+				 	config.init_lr,
+					self.global_step - config.warm_up_steps - config.same_lr_steps,
+					max_steps - config.warm_up_steps - config.same_lr_steps,
+					alpha=0.0
+				)
+
+				boundaries = [config.warm_up_steps, config.warm_up_steps + config.same_lr_steps] # before reaching warm_up steps, use the warm up learning rate.
+				values = [warm_up_lr, config.init_lr, cosine_lr]
+				learning_rate = tf.train.piecewise_constant(self.global_step, boundaries, values)
+				print "learning rate warm up lr from %s to %s in %s steps, then keep for %s steps, then cosine learning rate decay till %s steps" % (warm_up_start, config.init_lr, config.warm_up_steps, config.same_lr_steps, max_steps)
+			else:
+				decay_steps = int(config.train_num_examples / config.im_batch_size * config.num_epoch_per_decay)
+				learning_rate = tf.train.exponential_decay(
+				 	config.init_lr,
+					self.global_step,
+					decay_steps,
+					config.learning_rate_decay,
+					staircase=True
+				)
+				print "learning rate exponential_decay: every %s steps then lr*%s" % (decay_steps, config.learning_rate_decay)
+
+			self.learning_rate = learning_rate
+		else:
+			self.learning_rate = None
+
 		if config.optimizer == 'adadelta':
 			self.opt = tf.train.AdadeltaOptimizer(learning_rate)
 		elif config.optimizer == "adam":
@@ -64,21 +93,24 @@ class Trainer():
 		elif config.optimizer == "sgd":
 			self.opt = tf.train.GradientDescentOptimizer(learning_rate)
 		elif config.optimizer == "momentum":
-			self.opt = tf.train.MomentumOptimizer(learning_rate,momentum=config.momentum)
+			self.opt = tf.train.MomentumOptimizer(learning_rate, momentum=config.momentum)
 		else:
 			print "optimizer not implemented"
 			sys.exit()
 
+		self.rpn_label_losses = [model.rpn_label_loss for model in models]
+		self.rpn_box_losses = [model.rpn_box_loss for model in models]
+		self.fastrcnn_label_losses = [model.fastrcnn_label_loss for model in models]
+		self.fastrcnn_box_losses = [model.fastrcnn_box_loss for model in models]
+		
 
+		if config.wd is not None:
+			self.wd = [model.wd for model in models]
+		if config.use_small_object_head:
+			self.so_label_losses = [model.so_label_loss for model in models]
 
-		# for debug
-		self.rpn_label_loss = models[0].rpn_label_loss
-		self.rpn_box_loss = models[0].rpn_box_loss
-		self.fastrcnn_label_loss = models[0].fastrcnn_label_loss
-		self.fastrcnn_box_loss = models[0].fastrcnn_box_loss
-
-		#self.loss = model.loss # get the loss funcion
-		#self.grads = self.opt.compute_gradients(self.loss)
+		if config.add_act:
+			self.act_losses = [model.act_losses for model in self.models]
 
 		self.losses = []
 		self.grads = []
@@ -116,11 +148,58 @@ class Trainer():
 		
 		feed_dict = {}
 	
-		for batch_data,model in zip(batch_datas,self.models):
+		for batch_data, model in zip(batch_datas, self.models): # if batch is smaller so will the input?
 			feed_dict.update(model.get_feed_dict(batch_data,is_train=True))
+
+		sess_input = []
+		sess_input.append(self.loss)
+
+		for i in xrange(len(self.models)):
+			sess_input.append(self.rpn_label_losses[i])
+			sess_input.append(self.rpn_box_losses[i])
+			sess_input.append(self.fastrcnn_label_losses[i])
+			sess_input.append(self.fastrcnn_box_losses[i])
+			
+			if config.wd is not None:
+				sess_input.append(self.wd[i])
+
+			if config.use_small_object_head:
+				sess_input.append(self.so_label_losses[i])
+			if config.add_act:
+				sess_input.append(self.act_losses[i])
+
+		sess_input.append(self.train_op)
+		sess_input.append(self.learning_rate)
+
+		outs = sess.run(sess_input,feed_dict=feed_dict)
+
+		loss = outs[0]
+
+		skip = 4 + int(config.add_act) + int(config.use_small_object_head)
+		rpn_label_losses = outs[1::skip][:len(self.models)]
+		rpn_box_losses = outs[2::skip][:len(self.models)]
+		fastrcnn_label_losses = outs[3::skip][:len(self.models)]
+		fastrcnn_box_losses = outs[4::skip][:len(self.models)]
 		
+		now = 4
+		wd = [-1 for m in self.models]
+		if config.wd is not None:
+			now+=1
+			wd = outs[now::skip][:len(self.models)]
+
+		so_label_losses = [-1 for m in self.models]
+		if config.use_small_object_head:
+			now+=1
+			so_label_losses = outs[now::skip][:len(self.models)]
+		act_losses = [-1 for m in self.models]
 		if config.add_act:
-			out = [self.loss,self.rpn_label_loss, self.rpn_box_loss, self.fastrcnn_label_loss, self.fastrcnn_box_loss,self.train_op]
+			now+=1
+			act_losses = outs[now::skip][:len(self.models)]
+		
+
+		"""
+		if config.add_act:
+			out = [self.loss, self.rpn_label_loss, self.rpn_box_loss, self.fastrcnn_label_loss, self.fastrcnn_box_loss, self.train_op]
 
 			act_losses_pl = [model.act_losses for model in self.models]
 			out = act_losses_pl + out
@@ -131,8 +210,9 @@ class Trainer():
 		else:
 			loss,rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss, train_op = sess.run([self.loss,self.rpn_label_loss, self.rpn_box_loss, self.fastrcnn_label_loss, self.fastrcnn_box_loss,self.train_op],feed_dict=feed_dict)
 			act_losses = None
-		
-		return loss,rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss, train_op, act_losses
+		"""
+		learning_rate = outs[-1]
+		return loss, wd, rpn_label_losses, rpn_box_losses, fastrcnn_label_losses, fastrcnn_box_losses, so_label_losses, act_losses, learning_rate
 
 	
 

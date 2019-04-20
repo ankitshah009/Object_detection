@@ -8,17 +8,17 @@ import tensorflow as tf
 
 import cv2
 
-from models import get_model, resizeImage
+from models import get_model,resizeImage
 
-import math, time, json, random, operator
+import math,time,json,random,operator
 import cPickle as pickle
 import pycocotools.mask as cocomask
 
 
-from utils import Dataset, Summary, get_op_tensor_name
+from utils import Dataset,Summary,get_op_tensor_name
 
-from class_ids import targetClass2id_new_nopo
-targetClass2id = targetClass2id_new_nopo
+from class_ids import targetClass2id_mergeProp
+targetClass2id = targetClass2id_mergeProp
 
 targetid2class = {targetClass2id[one]:one for one in targetClass2id}
 
@@ -26,71 +26,64 @@ def get_args():
 	global targetClass2id, targetid2class
 	parser = argparse.ArgumentParser()
 
-	parser.add_argument("--video_dir", default=None)
-	parser.add_argument("--video_lst_file", default=None, help="video_file_path = os.path.join(video_dir, $line)")
+	parser.add_argument("--video_dir",default=None)
+	parser.add_argument("--video_lst_file",default=None,help="video_file_path = os.path.join(video_dir, $line)")
 
-	parser.add_argument("--out_dir", default=None, help="out_dir/$basename/%%d.json, start from 0 index")
+	parser.add_argument("--out_dir",default=None,help="out_dir/$videoname.mp4/%%d.json, start from 0 index")
 
-	parser.add_argument("--frame_gap", default=8, type=int)
+	parser.add_argument("--frame_gap",default=8, type=int)
 
 	parser.add_argument("--threshold_conf",default=0.0001,type=float)
 
 	# ------ for box feature extraction
-	parser.add_argument("--get_box_feat", action="store_true",help="this will generate (num_box, 256, 7, 7) tensor for each frame")
-	parser.add_argument("--box_feat_path", default=None,help="output will be out_dir/$basename/%%d.npy, start from 0 index")
+	parser.add_argument("--get_box_feat",action="store_true",help="this will generate (num_box, 256, 7, 7) tensor for each frame")
+	parser.add_argument("--box_feat_path",default=None,help="output will be out_dir/$videoname.mp4/%%d.npy, start from 0 index")
 
 	# ---- gpu params
-	parser.add_argument("--gpu", default=1, type=int, help="number of gpu")
-	parser.add_argument("--gpuid_start", default=0, type=int, help="start of gpu id")
-	parser.add_argument('--im_batch_size', type=int, default=1)
-	parser.add_argument("--use_all_mem", action="store_true")
+	parser.add_argument("--gpu",default=1,type=int,help="number of gpu")
+	parser.add_argument("--gpuid_start",default=0,type=int,help="start of gpu id")
+	parser.add_argument('--im_batch_size',type=int,default=1)
+	parser.add_argument("--use_all_mem",action="store_true")
 
 	# --- for internal visualization
-	parser.add_argument("--visualize", action="store_true")
-	parser.add_argument("--vis_path", default=None)
-	parser.add_argument("--vis_thres", default=0.7, type=float)
+	parser.add_argument("--visualize",action="store_true")
+	parser.add_argument("--vis_path",default=None)
+	parser.add_argument("--vis_thres",default=0.7,type=float)
 	
 
 	# ----------- model params
-	parser.add_argument("--num_class", type=int, default=15, help="num catagory + 1 background")
+	parser.add_argument("--num_class",type=int,default=17,help="num catagory + 1 background")
 
-	parser.add_argument("--model_path", default="/app/object_detection_model")
+	parser.add_argument("--model_path",default="/app/object_detection_model")
 
-	parser.add_argument("--rpn_batch_size", type=int, default=256, help="num roi per image for RPN  training")
-	parser.add_argument("--frcnn_batch_size", type=int, default=512, help="num roi per image for fastRCNN training")
+	parser.add_argument("--rpn_batch_size",type=int,default=256,help="num roi per image for RPN  training")
+	parser.add_argument("--frcnn_batch_size",type=int,default=512,help="num roi per image for fastRCNN training")
 	
-	parser.add_argument("--rpn_test_post_nms_topk", type=int, default=1000 ,help="test post nms, input to fast rcnn")
+	parser.add_argument("--rpn_test_post_nms_topk",type=int,default=2000,help="test post nms, input to fast rcnn")
 
-	parser.add_argument("--max_size", type=int, default=1920, help="num roi per image for RPN and fastRCNN training")
-	parser.add_argument("--short_edge_size", type=int, default=1080, help="num roi per image for RPN and fastRCNN training")
+	parser.add_argument("--max_size",type=int,default=1920,help="num roi per image for RPN and fastRCNN training")
+	parser.add_argument("--short_edge_size",type=int,default=1080,help="num roi per image for RPN and fastRCNN training")
 
 	# ---- tempory: for activity detection model
-	parser.add_argument("--actasobj", action="store_true")
-	parser.add_argument("--actmodel_path", default="/app/activity_detection_model")
-
-	parser.add_argument("--resnet152",action="store_true",help="")
-	parser.add_argument("--resnet50",action="store_true",help="")
-	parser.add_argument("--resnet34",action="store_true",help="")
-	parser.add_argument("--resnet18",action="store_true",help="")
-	parser.add_argument("--use_se",action="store_true",help="use squeeze and excitation in backbone")
-	parser.add_argument("--use_frcnn_class_agnostic", action="store_true", help="use class agnostic fc head")
-	parser.add_argument("--use_att_frcnn_head", action="store_true",help="use attention to sum [K, 7, 7, C] feature into [K, C]")
+	parser.add_argument("--actasobj",action="store_true")
+	parser.add_argument("--actmodel_path",default="/app/activity_detection_model")
 
 
 	# --------------- exp junk
-	parser.add_argument("--use_dilations", action="store_true", help="use dilations=2 in res5")
-	parser.add_argument("--use_deformable", action="store_true", help="use deformable conv")
-	parser.add_argument("--add_act",action="store_true", help="add activitiy model")
-	parser.add_argument("--finer_resolution", action="store_true", help="fpn use finer resolution conv")
-	parser.add_argument("--fix_fpn_model", action="store_true", help="for finetuneing a fpn model, whether to fix the lateral and poshoc weights")
-	parser.add_argument("--is_cascade_rcnn", action="store_true", help="cascade rcnn on top of fpn")
-	parser.add_argument("--add_relation_nn", action="store_true", help="add relation network feature")
+	parser.add_argument("--obj_v2",action="store_true")
+	parser.add_argument("--obj_v3",action="store_true")
+	parser.add_argument("--tall_box",action="store_true")
+	parser.add_argument("--wide_box",action="store_true")
+	parser.add_argument("--wide_v2",action="store_true")
+	parser.add_argument("--add_act",action="store_true",help="add activitiy model")
+	parser.add_argument("--finer_resolution",action="store_true",help="fpn use finer resolution conv")
+	parser.add_argument("--fix_fpn_model",action="store_true",help="for finetuneing a fpn model, whether to fix the lateral and poshoc weights")
+	parser.add_argument("--is_cascade_rcnn",action="store_true",help="cascade rcnn on top of fpn")
+	parser.add_argument("--add_relation_nn",action="store_true",help="add relation network feature")
 
-	parser.add_argument("--test_frame_extraction", action="store_true")
-	parser.add_argument("--use_my_naming", action="store_true")
 
 	args = parser.parse_args()
-	
+
 	assert args.gpu == args.im_batch_size # one gpu one image
 
 	args.controller = "/cpu:0" # parameter server
@@ -105,29 +98,13 @@ def get_args():
 
 	assert len(targetClass2id) == args.num_class, (len(targetClass2id), args.num_class)
 
-	# ------- 04/2019 dilated
-	args.use_dilations = True
-
 	# ---------------more defautls
-	args.diva_class3 = True
-	args.diva_class = False
-	args.diva_class2 = False
-	args.use_small_object_head = False
-	args.use_so_score_thres = False
-	args.use_so_association = False
-	args.use_gn = False
-	args.so_person_topk = 10
-	args.use_conv_frcnn_head = False
-	args.use_cpu_nms = False
-	args.use_bg_score = False
-	args.freeze_rpn = True
-	args.freeze_fastrcnn = True
 	args.freeze = 2
-	args.small_objects = ["Prop", "Push_Pulled_Object", "Prop_plus_Push_Pulled_Object", "Bike"]
 	args.no_obj_detect = False
+	args.diva_class = True
 	args.add_mask = False
 	args.is_fpn = True
-	#args.new_tensorpack_model = True
+	args.new_tensorpack_model = True
 	args.mrcnn_head_dim = 256
 	args.is_train = False
 
@@ -137,6 +114,9 @@ def get_args():
 		
 
 	args.fpn_resolution_requirement = float(args.anchor_strides[3]) # [3] is 32, since we build FPN with r2,3,4,5?
+
+		
+
 		
 	args.max_size = np.ceil(args.max_size / args.fpn_resolution_requirement) * args.fpn_resolution_requirement
 
@@ -146,18 +126,7 @@ def get_args():
 
 	# ---- all the mask rcnn config
 
-	args.resnet_num_block = [3, 4, 23, 3] # resnet 101
-	args.use_basic_block = False # for resnet-34 and resnet-18
-	if args.resnet152:
-		args.resnet_num_block = [3, 8, 36, 3]
-	if args.resnet50:
-		args.resnet_num_block = [3, 4, 6, 3]
-	if args.resnet34:
-		args.resnet_num_block = [3, 4, 6, 3]
-		args.use_basic_block = True
-	if args.resnet18:
-		args.resnet_num_block = [2, 2, 2, 2]
-		args.use_basic_block = True
+	args.resnet_num_block = [3,4,23,3] # resnet 101
 	
 	args.anchor_stride = 16 # has to be 16 to match the image feature total stride
 	args.anchor_sizes = (32,64,128,256,512)
@@ -187,7 +156,7 @@ def get_args():
 	args.fastrcnn_nms_iou_thres = 0.5
 
 	args.result_score_thres = args.threshold_conf
-	args.result_per_im = 100 
+	args.result_per_im = 200 
 
 	return args
 
@@ -277,20 +246,19 @@ if __name__ == "__main__":
 			video_out_path = os.path.join(args.out_dir, videoname)
 			if not os.path.exists(video_out_path):
 				os.makedirs(video_out_path)
-
 			# for box feature
 			if args.get_box_feat:
 				feat_out_path = os.path.join(args.box_feat_path, videoname)
 				if not os.path.exists(feat_out_path):
 					os.makedirs(feat_out_path)
-					
 			#frame_width = vcap.get(cv2.cv.CV_CAP_PROP_FRAME_WIDTH)
 			#frame_height = vcap.get(cv2.cv.CV_CAP_PROP_FRAME_HEIGHT)
 			#fps = vcap.get(cv2.cv.CV_CAP_PROP_FPS)
 			# opencv 2
-			#frame_count = vcap.get(cv2.cv.CV_CAP_PROP_FRAME_COUNT)
+			frame_count = vcap.get(cv2.cv.CV_CAP_PROP_FRAME_COUNT)
 			# opencv 3
-			frame_count = vcap.get(cv2.CAP_PROP_FRAME_COUNT)
+			#frame_count = vcap.get(cv2.CAP_PROP_FRAME_COUNT)
+				
 
 			# 3. read frame one by one
 			cur_frame=0
@@ -312,12 +280,6 @@ if __name__ == "__main__":
 
 				im = frame.astype("float32")
 
-				if args.test_frame_extraction:
-					frame_file = os.path.join(video_out_path, "%d.jpg"%cur_frame)
-					cv2.imwrite(frame_file, im)
-					cur_frame+=1
-					continue
-
 				resized_image = resizeImage(im, args.short_edge_size, args.max_size)
 
 				scale = (resized_image.shape[0]*1.0/im.shape[0] + resized_image.shape[1]*1.0/im.shape[1])/2.0
@@ -327,7 +289,7 @@ if __name__ == "__main__":
 				if args.get_box_feat:
 					sess_input = [model.final_boxes, model.final_labels, model.final_probs, model.fpn_box_feat]
 
-					final_boxes, final_labels, final_probs, box_feats = sess.run(sess_input,feed_dict=feed_dict)
+					final_boxes, final_labels, final_probs,box_feats = sess.run(sess_input,feed_dict=feed_dict)
 					assert len(box_feats) == len(final_boxes)
 					# save the box feature first
 
@@ -336,7 +298,7 @@ if __name__ == "__main__":
 				else:
 					sess_input = [model.final_boxes, model.final_labels, model.final_probs]
 
-					final_boxes, final_labels, final_probs = sess.run(sess_input, feed_dict=feed_dict)
+					final_boxes, final_labels, final_probs = sess.run(sess_input,feed_dict=feed_dict)
 				#print "sess run done"
 				# scale back the box to original image size
 				final_boxes = final_boxes / scale
@@ -365,10 +327,7 @@ if __name__ == "__main__":
 					pred.append(res)
 
 				#predfile = os.path.join(args.out_dir, "%s_F_%08d.json"%(videoname, cur_frame))
-				if args.use_my_naming:
-					predfile = os.path.join(video_out_path, "%s_F_%08d.json"%(os.path.splitext(videoname)[0], cur_frame))
-				else:
-					predfile = os.path.join(video_out_path, "%d.json"%(cur_frame))
+				predfile = os.path.join(video_out_path, "%d.json"%(cur_frame))
 				with open(predfile,"w") as f:
 					json.dump(pred, f)
 
@@ -385,7 +344,4 @@ if __name__ == "__main__":
 					vis_count+=1
 
 				cur_frame+=1
-
-			if args.test_frame_extraction:
-				tqdm.write("video %s got %s frames, opencv said frame count is %s" % (videoname, cur_frame, frame_count))
 

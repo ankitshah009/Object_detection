@@ -3,7 +3,7 @@ import tensorflow as tf
 import math,re,cv2
 from operator import mul
 import numpy as np
-
+from deformable_helper import _tf_batch_map_offsets
 
 VERY_NEGATIVE_NUMBER = -1e30
 
@@ -12,6 +12,25 @@ VERY_NEGATIVE_NUMBER = -1e30
 def conv_out_size_same(size, stride):
 	return int(math.ceil(float(size) / float(stride)))
 
+
+# softnms
+from softnms.nms import cpu_soft_nms, cpu_nms
+
+# given a list of boxes, 
+# dets : [N, 5], in (x1,y1,x2,y2, score)
+# kevin sigma uses 1.0
+# method 1 -> linear, 2 -> gaussian(paper)
+#def soft_nms(dets, sigma=0.5, Nt=0.3, threshold=0.001, method=1):
+def soft_nms(dets, sigma=0.3, Nt=0.4, threshold=0.001, method=2):
+	keep = cpu_soft_nms(np.ascontiguousarray(dets, dtype=np.float32),
+						np.float32(sigma), np.float32(Nt),
+						np.float32(threshold),
+						np.uint8(method))
+	return keep
+
+# cpu nms
+def nms(dets, thresh):
+	return cpu_nms(dets, thresh)
 
 # given regex to get the parameter to do regularization
 def wd_cost(regex,wd,scope):
@@ -42,6 +61,34 @@ def wd_cost(regex,wd,scope):
 			return tf.add_n(costs,name=scope)
 
 
+def group_norm(x, group=32, gamma_init=tf.constant_initializer(1.),scope="gn"):
+	with tf.variable_scope(scope):
+		shape = x.get_shape().as_list()
+		ndims = len(shape)
+		assert ndims == 4, shape
+		chan = shape[1]
+		assert chan % group == 0, chan
+		group_size = chan // group
+
+		orig_shape = tf.shape(x)
+		h, w = orig_shape[2], orig_shape[3]
+
+		x = tf.reshape(x, tf.stack([-1, group, group_size, h, w]))
+
+		mean, var = tf.nn.moments(x, [2, 3, 4], keep_dims=True)
+
+		new_shape = [1, group, group_size, 1, 1]
+
+		beta = tf.get_variable('beta', [chan], initializer=tf.constant_initializer())
+		beta = tf.reshape(beta, new_shape)
+
+		gamma = tf.get_variable('gamma', [chan], initializer=gamma_init)
+		gamma = tf.reshape(gamma, new_shape)
+
+		out = tf.nn.batch_normalization(x, mean, var, beta, gamma, 1e-5, name='output')
+		return tf.reshape(out, orig_shape, name='output')
+
+
 # relation network head, for enhancing the boxes features
 # boxe_feat: [K,1024]
 # boxes:[K,4]
@@ -53,19 +100,17 @@ def relation_network(box_appearance_feat, boxes, group=16, geo_feat_dim=64, scop
 		group_feat_dim = box_feat_dim / group
 		# [K,4] -> [K,K,4]
 		# given the absolute box, get the pairwise relative geometric coordinates
-		box_geo_encoded = geometric_encoding(boxes,scope="geometric_encoding")
+		box_geo_encoded = geometric_encoding(boxes, scope="geometric_encoding")
 		# [K,K,4] -> [K,K,geo_feat_dim]
-		box_geo_feat = dense(box_geo_encoded,geo_feat_dim,activation=tf.nn.tanh,use_bias=True,wd=None,keep_first=False, scope="geo_emb")
-
+		box_geo_feat = dense(box_geo_encoded, geo_feat_dim, activation=tf.nn.tanh, use_bias=True, wd=None, keep_first=False, scope="geo_emb")
 
 		# [K,K,geo_feat_dim]
-		box_geo_feat = tf.transpose(box_geo_feat,perm=[2,0,1])
-		box_geo_feat = tf.expand_dims(box_geo_feat,axis=0) # [1,geo_feat_dim,K,K]
+		box_geo_feat = tf.transpose(box_geo_feat, perm=[2,0,1])
+		box_geo_feat = tf.expand_dims(box_geo_feat, axis=0) # [1,geo_feat_dim,K,K]
 		# [1,fc_dim,K,K]
 		box_geo_feat_wg = conv2d(box_geo_feat,fc_dim,kernel=1,stride=1,data_format="NCHW",scope="geo_conv")
 		box_geo_feat_wg = tf.squeeze(box_geo_feat_wg)
 		box_geo_feat_wg = tf.transpose(box_geo_feat_wg,perm=[1,2,0])
-
 
 		# -> [K,K,fc_dim]
 		box_geo_feat_wg_relu = tf.nn.relu(box_geo_feat_wg)
@@ -74,11 +119,11 @@ def relation_network(box_appearance_feat, boxes, group=16, geo_feat_dim=64, scop
 
 		# now we get the appearance stuff
 		#[K,1024]
-		query = dense(box_appearance_feat,box_feat_dim,activation=tf.identity,use_bias=False,wd=None,keep_first=False, scope="query_linear")
+		query = dense(box_appearance_feat, box_feat_dim, activation=tf.identity, use_bias=False, wd=None, keep_first=False, scope="query_linear")
 		# split head
 		#[K,16,1024/16]
-		query = tf.reshape(query,(-1,group,group_feat_dim))
-		query = tf.transpose(query,perm=[1,0,2]) # [16,K,1024/16]
+		query = tf.reshape(query, (-1, group, group_feat_dim))
+		query = tf.transpose(query, perm=[1, 0, 2]) # [16,K,1024/16]
 
 		key = dense(box_appearance_feat,box_feat_dim,activation=tf.identity,use_bias=False,wd=None,keep_first=False, scope="key_linear")
 		# split head
@@ -101,6 +146,72 @@ def relation_network(box_appearance_feat, boxes, group=16, geo_feat_dim=64, scop
 		weighted_softmax = tf.reshape(weighted_softmax,(tf.shape(weighted_softmax)[0]*group, tf.shape(weighted_softmax)[-1]))
 
 		#[K*16,K] * [K,1024] -> [K*16,1024]
+		output = tf.matmul(weighted_softmax,value)
+
+		#[K,16,1024]
+		output = tf.reshape(output,(-1,group,box_feat_dim))
+
+		#[K,1024]
+		output = dense(output,box_feat_dim,activation=tf.identity,use_bias=False,wd=None,keep_first=True, scope="output_linear")
+
+		return output
+
+# [K, 1024] / [K, 4] / [R, 4] / [R, 1024]
+# returns [K, 1024], attended for each K to all R
+def person_object_relation(box_appearance_feat, boxes, ref_boxes, ref_feat, group=16, geo_feat_dim=64, scope="RM"):
+	fc_dim = group # the geo feature for each group
+	with tf.variable_scope(scope):
+		box_feat_dim = box_appearance_feat.get_shape().as_list()[-1] # 1024
+		group_feat_dim = box_feat_dim / group
+		# [K,4], [R, 4] -> [K, R, 4]
+		# given the absolute box, get the pairwise relative geometric coordinates
+		box_geo_encoded = geometric_encoding_pair(boxes, ref_boxes, scope="geometric_encoding_pair")
+		# [K, R, 4] -> [K, R, geo_feat_dim]
+		box_geo_feat = dense(box_geo_encoded, geo_feat_dim, activation=tf.nn.tanh, use_bias=True, wd=None, keep_first=False, scope="geo_emb")
+
+		# [geo_feat_dim, K, R]
+		box_geo_feat = tf.transpose(box_geo_feat, perm=[2,0,1])
+		box_geo_feat = tf.expand_dims(box_geo_feat, axis=0) # [1,geo_feat_dim,K,R]
+		# [1,fc_dim,K,R]
+		box_geo_feat_wg = conv2d(box_geo_feat,fc_dim,kernel=1,stride=1,data_format="NCHW",scope="geo_conv")
+		box_geo_feat_wg = tf.squeeze(box_geo_feat_wg)
+		box_geo_feat_wg = tf.transpose(box_geo_feat_wg,perm=[1,2,0])
+
+		# -> [K,R,fc_dim]
+		box_geo_feat_wg_relu = tf.nn.relu(box_geo_feat_wg)
+		# [K,fc_dim,R]
+		box_geo_feat_wg_relu = tf.transpose(box_geo_feat_wg_relu,perm=[0,2,1])
+
+		# now we get the appearance stuff
+		#[K,1024]
+		query = dense(box_appearance_feat, box_feat_dim, activation=tf.identity, use_bias=False, wd=None, keep_first=False, scope="query_linear")
+		# split head
+		#[K,16,1024/16]
+		query = tf.reshape(query, (-1, group, group_feat_dim))
+		query = tf.transpose(query, perm=[1, 0, 2]) # [16,K,1024/16]
+
+		#[R, 1024]
+		key = dense(ref_feat, box_feat_dim,activation=tf.identity,use_bias=False,wd=None,keep_first=False, scope="key_linear")
+		# split head
+		#[R,16,1024/16]
+		key = tf.reshape(key,(-1,group,group_feat_dim))
+		key = tf.transpose(key,perm=[1,0,2]) # [16,R,1024/16]
+
+		value = ref_feat
+
+		# [16,K,R]
+		logits = tf.matmul(query, key,transpose_b=True)
+		logits_scaled = (1.0 / math.sqrt(float(group_feat_dim))) * logits
+		logits_scaled = tf.transpose(logits_scaled,perm=[1,0,2]) # [K,16,R]
+
+		# [K,16,R]
+		weighted_logits = tf.log(tf.maximum(box_geo_feat_wg_relu,1e-6)) + logits_scaled
+		weighted_softmax = tf.nn.softmax(weighted_logits)
+
+		# need to reshape for matmul
+		weighted_softmax = tf.reshape(weighted_softmax,(tf.shape(weighted_softmax)[0]*group, tf.shape(weighted_softmax)[-1]))
+
+		#[K*16,R] * [R,1024] -> [K*16,1024]
 		output = tf.matmul(weighted_softmax,value)
 
 		#[K,16,1024]
@@ -140,8 +251,43 @@ def geometric_encoding(boxes,scope="geometric_encoding"):
 		return output
 
 
+def geometric_encoding_pair(boxes1, boxes2,scope="geometric_encoding_pair"):
+	with tf.variable_scope(scope):
 
-def conv2d(x,out_channel, kernel,padding="SAME",stride=1,activation=tf.identity,use_bias=True,data_format="NHWC",W_init=None,scope="conv"):
+		x11,y11,x12,y12 = tf.split(boxes1, 4, axis=1)
+		w1 = x12 - x11
+		h1 = y12 - y11
+		center1_x = 0.5 * (x11+x12)
+		center1_y = 0.5 * (y11+y12)
+
+		x21,y21,x22,y22 = tf.split(boxes2, 4, axis=1)
+		w2 = x22 - x21
+		h2 = y22 - y21
+		center2_x = 0.5 * (x21+x22)
+		center2_y = 0.5 * (y21+y22)	
+
+		# [K, R]
+		delta_x = center1_x - tf.transpose(center2_x)
+		delta_x = delta_x / tf.tile(tf.transpose(w2), [tf.shape(delta_x)[0], 1])
+		delta_x = tf.log(tf.maximum(tf.abs(delta_x),1e-3))
+
+		delta_y = center1_y - tf.transpose(center2_y)
+		delta_y = delta_y / tf.tile(tf.transpose(w2), [tf.shape(delta_y)[0], 1])
+		delta_y = tf.log(tf.maximum(tf.abs(delta_y),1e-3))
+
+		delta_w = tf.log(w1 / tf.transpose(w2))
+
+		delta_h = tf.log(h1 / tf.transpose(h2))
+
+		#[K, R,4]
+		output = tf.stack([delta_x,delta_y,delta_w,delta_h],axis=2)
+		
+		return output
+def GlobalAvgPooling(x, data_format='NHWC'):
+	axis = [1, 2] if data_format == 'NHWC' else [2, 3]
+	return tf.reduce_mean(x, axis, name='output')
+
+def conv2d(x, out_channel, kernel, padding="SAME", stride=1, activation=tf.identity, dilations=1, use_bias=True,data_format="NHWC", W_init=None, scope="conv"):
 	with tf.variable_scope(scope):
 		in_shape = x.get_shape().as_list()
 
@@ -155,15 +301,18 @@ def conv2d(x,out_channel, kernel,padding="SAME",stride=1,activation=tf.identity,
 		filter_shape = kernel_shape + [in_channel,out_channel]
 
 		if data_format == "NHWC":
-			stride = [1,stride,stride,1]
+			stride = [1, stride, stride,1]
+			dilations = [1, dilations, dilations, 1]
 		else:
 			stride = [1,1,stride,stride]
+			dilations = [1, 1, dilations, dilations]
+
 
 		if W_init is None:
 			W_init = tf.variance_scaling_initializer(scale=2.0)
 		W = tf.get_variable('W', filter_shape, initializer=W_init)
 
-		conv = tf.nn.conv2d(x, W, stride, padding, data_format=data_format)
+		conv = tf.nn.conv2d(x, W, stride, padding, dilations=dilations, data_format=data_format)
 
 		if use_bias:
 			b_init = tf.constant_initializer()
@@ -174,7 +323,7 @@ def conv2d(x,out_channel, kernel,padding="SAME",stride=1,activation=tf.identity,
 
 	return ret
 
-def deconv2d(x,out_channel, kernel,padding="SAME",stride=1,activation=tf.identity,use_bias=True,data_format="NHWC",W_init=None,scope="deconv"):
+def deconv2d(x,out_channel, kernel,padding="SAME",stride=1, activation=tf.identity,use_bias=True,data_format="NHWC",W_init=None,scope="deconv"):
 
 	with tf.variable_scope(scope):
 		in_shape = x.get_shape().as_list()
@@ -190,7 +339,6 @@ def deconv2d(x,out_channel, kernel,padding="SAME",stride=1,activation=tf.identit
 		if W_init is None:
 			W_init = tf.variance_scaling_initializer(scale=2.0)
 		b_init = tf.constant_initializer()
-
 		
 		with rename_get_variable({'kernel': 'W', 'bias': 'b'}):
 			layer = tf.layers.Conv2DTranspose(
@@ -245,19 +393,59 @@ def custom_getter_scope(custom_getter):
 	with tf.variable_scope(scope, custom_getter=custom_getter):
 		yield
 
-
-def resnet_bottleneck(l, ch_out, stride,tf_pad_reverse=False):
-	l, shortcut = l, l
-	l = conv2d(l, ch_out, 1, activation=BNReLU,scope='conv1',use_bias=False,data_format="NCHW")
-	if stride == 2:
-		l = tf.pad(l, [[0, 0], [0, 0], maybe_reverse_pad(0,1,tf_pad_reverse), maybe_reverse_pad(0,1,tf_pad_reverse)])
-		l = conv2d(l, ch_out, 3, stride=2, activation=BNReLU, padding='VALID',scope='conv2',use_bias=False,data_format="NCHW")
+def resnet_basicblock(l, ch_out, stride,  dilations=1, deformable=False, tf_pad_reverse=False, use_gn=False, use_se=False):
+	shortcut = l
+	if use_gn:
+		NormReLU = GNReLU
 	else:
-		l = conv2d(l, ch_out, 3, stride=stride, activation=BNReLU,scope='conv2',use_bias=False,data_format="NCHW")
-	l = conv2d(l, ch_out * 4, 1, activation=get_bn(zero_init=True),scope='conv3',use_bias=False,data_format="NCHW")
-	return l + resnet_shortcut(shortcut, ch_out * 4, stride, activation=get_bn(zero_init=False),data_format="NCHW")
+		NormReLU = BNReLU
+	l = conv2d(l, ch_out, 3, stride=stride, activation=NormReLU, use_bias=False, data_format="NCHW", scope='conv1')
+	l = conv2d(l, ch_out, 3, use_bias=False, activation=get_bn(use_gn, zero_init=True), data_format="NCHW", scope='conv2')
+	out = l + resnet_shortcut(shortcut, ch_out, stride, activation=get_bn(use_gn, zero_init=False), data_format="NCHW")
+	return tf.nn.relu(out)
 
-def resnet_shortcut(l, n_out, stride, activation=tf.identity,data_format="NCHW"):
+
+def resnet_bottleneck(l, ch_out, stride, dilations=1, deformable=False, tf_pad_reverse=False, use_gn=False, use_se=False):
+	l, shortcut = l, l
+	if use_gn:
+		NormReLU = GNReLU
+	else:
+		NormReLU = BNReLU
+	l = conv2d(l, ch_out, 1, activation=NormReLU,scope='conv1',use_bias=False,data_format="NCHW")
+	if stride == 2:	
+		
+		if deformable:
+			# l [1, C, H, W]
+			# 1. get the offset from conv2d [1, 18, H, W]
+			offset = conv2d(l, 2*3*3, 3, stride=1, padding="SAME", scope="conv2_offset", data_format="NCHW")
+			# for testing, use all zero offset, so this should be the same as regular conv2d
+			#input_h = tf.shape(l)[2]
+			#input_w = tf.shape(l)[3]
+			#offset = tf.fill(value=0.0, dims=[1, 2*3*3, input_h, input_w])
+			# get [1, ch_out, H/2, w/2]
+			l = deformable_conv2d(l, offset, ch_out, 3, scope="conv2", data_format="NCHW", use_bias=False)
+		else:
+			l = tf.pad(l, [[0, 0], [0, 0], maybe_reverse_pad(0, 1, tf_pad_reverse), maybe_reverse_pad(0,1,tf_pad_reverse)])
+			l = conv2d(l, ch_out, 3, dilations=dilations, stride=2, activation=NormReLU, padding='VALID',scope='conv2',use_bias=False,data_format="NCHW")
+		if dilations != 1: # weird shit
+		# [H+1, W+1]
+			l = tf.pad(l, [[0, 0], [0, 0], maybe_reverse_pad(0, 1, tf_pad_reverse), maybe_reverse_pad(0,1,tf_pad_reverse)])
+	else:
+		l = conv2d(l, ch_out, 3, dilations=dilations, stride=stride, activation=NormReLU,scope='conv2',use_bias=False,data_format="NCHW")
+	l = conv2d(l, ch_out * 4, 1, activation=get_bn(use_gn,zero_init=True),scope='conv3',use_bias=False,data_format="NCHW")
+
+	if use_se:
+		squeeze = GlobalAvgPooling(l, data_format='NCHW')
+		squeeze = dense(squeeze, ch_out // 4, activation=tf.nn.relu, W_init=tf.variance_scaling_initializer(), scope='fc1')
+		squeeze = dense(squeeze, ch_out * 4, activation=tf.nn.sigmoid, W_init=tf.variance_scaling_initializer(), scope='fc2')
+		ch_ax = 1 
+		shape = [-1, 1, 1, 1]
+		shape[ch_ax] = ch_out * 4
+		l = l * tf.reshape(squeeze, shape)
+
+	return l + resnet_shortcut(shortcut, ch_out * 4, stride, activation=get_bn(use_gn,zero_init=False),data_format="NCHW")
+
+def resnet_shortcut(l, n_out, stride, activation=tf.identity,data_format="NCHW",use_gn=False):
 	n_in = l.get_shape().as_list()[1 if data_format == 'NCHW' else 3]
 	if n_in != n_out:   # change dimension when channel is not the same
 		if stride == 2:
@@ -270,29 +458,51 @@ def resnet_shortcut(l, n_out, stride, activation=tf.identity,data_format="NCHW")
 	else:
 		return l
 
-def resnet_group(l, name, block_func, features, count, stride,reuse=False,tf_pad_reverse=False):
+def resnet_group(l, name, block_func, features, count, stride, dilations=1, use_deformable=False, modified_block_num=3, reuse=False, tf_pad_reverse=False, use_gn=False, use_se=False):
 	with tf.variable_scope(name):
 		if reuse:
 			tf.get_variable_scope().reuse_variables()
 		for i in range(0, count):
 			with tf.variable_scope('block{}'.format(i)):
+				dilations_ = 1
+				deformable_ = False
+				if i in range(count)[-modified_block_num:]:
+					dilations_ = dilations
+					deformable_ = use_deformable
+				
 				l = block_func(l, features,
-							   stride if i == 0 else 1,tf_pad_reverse=tf_pad_reverse)
+							   stride if i == 0 else 1, dilations=dilations_, deformable=deformable_, use_gn=use_gn, tf_pad_reverse=tf_pad_reverse, use_se=use_se)
 				# end of each block need an activation
 				l = tf.nn.relu(l)
 	return l
 
-def get_bn(zero_init=False):
-	if zero_init:
-		return lambda x, name: BatchNorm(x, gamma_init=tf.zeros_initializer(),scope="bn")
+def get_bn(use_gn=False,zero_init=False):
+	if use_gn:
+		if zero_init:
+			return lambda x, name: group_norm(x, gamma_init=tf.zeros_initializer(),scope="gn")
+		else:
+			return lambda x, name: group_norm(x,scope="gn")
 	else:
-		return lambda x, name: BatchNorm(x,scope="bn")
+		if zero_init:
+			return lambda x, name: BatchNorm(x, gamma_init=tf.zeros_initializer(),scope="bn")
+		else:
+			return lambda x, name: BatchNorm(x,scope="bn")
 
 def BNReLU(x, name=None):
 	"""
-	A shorthand of BatchNormalization + ReLU.
+	A shorthand of Normalization + ReLU.
 	"""
+
 	x = BatchNorm(x,scope="bn")
+	x = tf.nn.relu(x, name=name)
+	return x
+
+def GNReLU(x, name=None):
+	"""
+	A shorthand of Normalization + ReLU.
+	"""
+
+	x = group_norm(x,scope="gn")
 	x = tf.nn.relu(x, name=name)
 	return x
 
@@ -511,7 +721,7 @@ def get_iou_callable():
 
 # simple linear layer, without activatation # remember to add it
 def dense(x,output_size,W_init=None,b_init=None,activation=tf.identity,use_bias=True,wd=None,keep_first=True, scope="dense"):
-	with tf.variable_scope(scope):
+	with tf.variable_scope(scope, reuse=tf.AUTO_REUSE):
 		# tensorpack's fully connected keep the first dim and flatten the rest, apply W on the rest
 		if keep_first:
 			shape = x.get_shape().as_list()[1:]
@@ -550,7 +760,7 @@ def dense(x,output_size,W_init=None,b_init=None,activation=tf.identity,use_bias=
 			out = flat_out
 		return out
 
-def  maybe_reverse_pad(topleft, bottomright,reverse=False):
+def maybe_reverse_pad(topleft, bottomright,reverse=False):
 	if reverse:
 		return [bottomright, topleft]
 	else:
@@ -593,46 +803,74 @@ def resnet_conv5(image,num_block,reuse=False,tf_pad_reverse=False):
 	return l
 
 # fpn_resolution_requirement is 32 by default FPN
-def resnet_fpn_backbone(image, num_blocks,resolution_requirement,tf_pad_reverse=False,finer_resolution=False,freeze=0):
+def resnet_fpn_backbone(image, num_blocks,resolution_requirement, use_deformable=False, use_dilations=False, tf_pad_reverse=False,finer_resolution=False,freeze=0,use_gn=False,use_basic_block=False, use_se=False):
 	assert len(num_blocks) == 4
 	shape2d = tf.shape(image)[2:]
-	# padding to deal with odd size image?
+
+	# this gets the nearest H, W that can be zheng chu by 32
+	# 720 -> 736, 1080 -> 1088
 	mult = resolution_requirement * 1.0
 	new_shape2d = tf.to_int32(tf.ceil(tf.to_float(shape2d) / mult) * mult)
 	pad_shape2d = new_shape2d - shape2d
 
 	channel = image.shape[1]
 
+	if use_gn:
+		NormReLU = GNReLU
+	else:
+		NormReLU = BNReLU
+
+	block_func = resnet_bottleneck
+	if use_basic_block:
+		block_func = resnet_basicblock
+
 	pad_base = maybe_reverse_pad(2, 3,tf_pad_reverse)
-	l = tf.pad(image,[
+	
+	l = tf.pad(image, [
 			[0, 0], [0, 0], 
 			[pad_base[0], pad_base[1] + pad_shape2d[0]], 
 			[pad_base[0], pad_base[1] + pad_shape2d[1]]])
 	l.set_shape([None,channel,None,None])
 
+	# 720, 1280 -> 736, 1280 / 1080, 1920 -> 1088, 1920, zhengchu by 32
+	# actually 741/1093 due to the pad_base of [2, 3]
+	# pad_base is for first conv and max pool
+	#l = tf.Print(l, data=[tf.shape(l)], summarize=10) 
+
 	# rest is the same as c4 backbone
-	l = conv2d(l, 64, 7, stride=2, activation=BNReLU, padding='VALID',scope="conv0",use_bias=False,data_format="NCHW")
+	l = conv2d(l, 64, 7, stride=2, activation=NormReLU, padding='VALID',scope="conv0",use_bias=False,data_format="NCHW")
 	c1 = l
 	l = tf.pad(l, [[0, 0], [0, 0], maybe_reverse_pad(0, 1,tf_pad_reverse), maybe_reverse_pad(0, 1,tf_pad_reverse)]) # H+1,W+1
 	
 	l = MaxPooling(l, shape=3, stride=2, padding='VALID',scope='pool0',data_format="NCHW")
 	# here 4x down already, so smallest anchor box can on use these
-
-	#print l.get_shape()# (1,64,?,?)
-	c2 = resnet_group(l, 'group0', resnet_bottleneck, 64, num_blocks[0], stride=1,tf_pad_reverse=tf_pad_reverse)
+	#l = tf.Print(l, data=[tf.shape(l)], summarize=10) # [1 64 272 480] # 4X down from 1088 and 1920
+	
+	# resnet_group output channel is 64*4
+	c2 = resnet_group(l, 'group0', block_func, 64, num_blocks[0], stride=1, tf_pad_reverse=tf_pad_reverse,use_gn=use_gn, use_se=use_se)
 	if freeze >= 0: # tensorpack setting
 		c2 = tf.stop_gradient(c2)
 
+	#c2 = tf.Print(c2, data=[tf.shape(c2)], summarize=10) # [1 256 272 480] # 
 
-	#print l.get_shape()# (1,256,?,?)
-	c3 = resnet_group(c2, 'group1', resnet_bottleneck, 128, num_blocks[1], stride=2,tf_pad_reverse=tf_pad_reverse)
+	# for dilated conv and deformable conv, we will add to the last 3 block in each group
+	mbn = 3 # modify the last 3 conv block
+	# [4]
+	c3 = resnet_group(c2, 'group1', block_func, 128, num_blocks[1], dilations=1, modified_block_num=mbn, stride=2, use_deformable=use_deformable, tf_pad_reverse=tf_pad_reverse,use_gn=use_gn, use_se=use_se)
 	if freeze >= 1:
 		c3 = tf.stop_gradient(c3)
-	#print l.get_shape()# (1,512,?,?)
-	c4 = resnet_group(c3, 'group2', resnet_bottleneck, 256, num_blocks[2], stride=2,tf_pad_reverse=tf_pad_reverse)
+
+	# [23]
+	c4 = resnet_group(c3, 'group2', block_func, 256, num_blocks[2], dilations=1, modified_block_num=mbn, stride=2, use_deformable=use_deformable, tf_pad_reverse=tf_pad_reverse,use_gn=use_gn, use_se=use_se)
 	if freeze >= 2:
 		c4 = tf.stop_gradient(c4)
-	c5 = resnet_group(c4, "group3", resnet_bottleneck, 512, num_blocks[3], stride=2,tf_pad_reverse=tf_pad_reverse)
+	#c4 = tf.Print(c4, data=[tf.shape(c4)], summarize=10) # [1 1024 68 120]
+
+	# [3]
+	# people change the last stride to 1 and with dilations 2?
+	c5 = resnet_group(c4, "group3", block_func, 512, num_blocks[3], dilations=2 if use_dilations else 1, use_deformable=use_deformable, modified_block_num=mbn, stride=2, tf_pad_reverse=tf_pad_reverse,use_gn=use_gn, use_se=use_se)
+	#c5 = tf.Print(c5, data=[tf.shape(c5)], summarize=10) # [1 2048 34 60] same for dilation or not
+
 	if freeze >= 3:
 		c5 = tf.stop_gradient(c5)
 	## 32x downsampling up to now
@@ -640,7 +878,7 @@ def resnet_fpn_backbone(image, num_blocks,resolution_requirement,tf_pad_reverse=
 	return c2,c3,c4,c5
 
 # the FPN model
-def fpn_model(c2345,num_channel,scope):
+def fpn_model(c2345,num_channel,scope,use_gn=False):
 
 	def upsample2x(x,scope):
 		with tf.name_scope(scope):
@@ -668,7 +906,11 @@ def fpn_model(c2345,num_channel,scope):
 
 	with tf.variable_scope(scope):
 		# each conv feature go through 1x1 conv, then add to 2x upsampled feature, then add 3x3 conv to get final feature
-		lat_2345 = [conv2d(c, num_channel, 1, stride=1, activation=tf.identity, padding='SAME',scope="lateral_1x1_c%s"%(i+2),use_bias=True,data_format="NCHW",W_init=tf.variance_scaling_initializer(scale=1.0)) for i,c in enumerate(c2345)]
+		lat_2345 = [conv2d(c, num_channel, 1, stride=1, activation=tf.identity, padding='SAME',scope="lateral_1x1_c%s"%(i+2), use_bias=True, data_format="NCHW", W_init=tf.variance_scaling_initializer(scale=1.0)) for i,c in enumerate(c2345)]
+
+
+		if use_gn:
+			lat_2345 = [group_norm(c, scope='gn_c{}'.format(i + 2)) for i, c in enumerate(lat_2345)]
 
 		lat_sum_5432 = []
 		for idx, lat in enumerate(lat_2345[::-1]):
@@ -679,6 +921,9 @@ def fpn_model(c2345,num_channel,scope):
 				lat_sum_5432.append(lat)
 
 		p2345 = [conv2d(c, num_channel, 3, stride=1, activation=tf.identity, padding='SAME',scope="posthoc_3x3_p%s"%(i+2),use_bias=True,data_format="NCHW",W_init=tf.variance_scaling_initializer(scale=1.0)) for i,c in enumerate(lat_sum_5432[::-1])]
+
+		if use_gn:
+			p2345 = [group_norm(c,scope='gn_p{}'.format(i + 2)) for i, c in enumerate(p2345)]
 
 		p6 = MaxPooling(p2345[-1], shape=1, stride=2, padding='VALID',scope='maxpool_p6',data_format="NCHW")
 		return p2345+[p6]
@@ -814,6 +1059,50 @@ def sample_fast_rcnn_targets(boxes, gt_boxes, gt_labels, config,fg_ratio=None):
 	return tf.stop_gradient(ret_boxes),tf.stop_gradient(ret_labels), fg_inds_wrt_gt
 
 
+# sample small object training
+# boxes: [C, N, 4]
+# gt_boxes: [C], [G, 4]
+# gt_labels: [C], [G] # [0, 1]
+# return box_labels: [C, N_] # 0 or 1
+def get_so_labels(boxes, gt_boxes, gt_labels, config):
+
+	box_labels = []
+	for i in xrange(len(config.small_objects)):
+		iou = pairwise_iou(boxes[i], gt_boxes[i])
+		#print iou.get_shape()  # [1536,0] # gt_boxes could be empty
+
+		def sample_fg_bg(iou):
+			#fg_ratio = 0.2
+			# [K,M] # [M] is the ground truth
+			# [K] # max iou for each proposal to the ground truth
+			fg_mask = tf.reduce_max(iou,axis=1) >= config.fastrcnn_fg_thres # iou 0.5
+			fg_inds = tf.reshape(tf.where(fg_mask),[-1]) # [K_FG] # index of fg_mask true element
+			# sometimes this does not add up to 512, then the stacking will raise error
+			#num_fg = tf.minimum(int(config.fastrcnn_batch_per_im * fg_ratio),tf.size(fg_inds))
+			#fg_inds = tf.random_shuffle(fg_inds)[:num_fg]# so the pos box is at least > fg_thres iou
+			# use all fg
+			
+			bg_inds = tf.reshape(tf.where(tf.logical_not(fg_mask)), [-1])
+			#num_bg = tf.minimum(config.fastrcnn_batch_per_im - num_fg, tf.size(bg_inds))
+			#bg_inds = tf.random_shuffle(bg_inds)[:num_bg]
+			return fg_inds, bg_inds  
+
+		fg_inds, bg_inds = sample_fg_bg(iou)
+
+		# handle when there is no ground truth small object in the image
+		best_iou_ind = tf.cond(tf.equal(tf.size(gt_boxes[i]), 0), 
+										lambda: tf.zeros_like([], dtype=tf.int64),
+										lambda: tf.argmax(iou, axis=1)) #[N+M],# proposal -> gt best matched# so each proposal has the gt's index
+		# [N_FG] -> gt Index, so 0-M-1
+		# each pos proposal box assign to the best gt box
+		# indexes of gt_boxes that matched to fg_box
+		fg_inds_wrt_gt = tf.gather(best_iou_ind, fg_inds) # get the pos's gt box indexes
+
+		this_labels = tf.concat([tf.gather(gt_labels[i], fg_inds_wrt_gt), tf.zeros_like(bg_inds, dtype=tf.int64)], axis=0, name="sampled_labels")
+		box_labels.append(this_labels)
+	box_labels = tf.stack(box_labels, axis=0)
+	return tf.stop_gradient(box_labels)
+
 
 
 # fix the tf.image.crop_and_resize to do roi_align
@@ -938,9 +1227,6 @@ def generate_rpn_proposals(boxes, scores, img_shape,config,pre_nms_topk=None): #
 	return final_boxes, final_scores
 
 
-
-
-
 # given the anchor regression prediction, 
 # get the refined anchor boxes
 def decode_bbox_target(box_predictions, anchors,decode_clip=np.log(1333/16.0)):
@@ -966,9 +1252,11 @@ def decode_bbox_target(box_predictions, anchors,decode_clip=np.log(1333/16.0)):
 	return tf.reshape(out,tf.shape(anchors))
 
 def resizeImage(im, short_size, max_size):
-	h,w = im.shape[:2]
-	neww,newh = get_new_hw(h,w,short_size, max_size)
-	return cv2.resize(im,(neww,newh),interpolation=cv2.INTER_LINEAR)
+	h, w = im.shape[:2]
+	neww, newh = get_new_hw(h, w, short_size, max_size)
+	if (h==newh) and (w==neww):
+		return im
+	return cv2.resize(im, (neww, newh), interpolation=cv2.INTER_LINEAR)
 
 def get_new_hw(h,w,size,max_size):
 	scale = size * 1.0 / min(h, w)
@@ -1034,18 +1322,101 @@ def encode_bbox_target(target_boxes,anchors):
 		return tf.reshape(encoded,tf.shape(target_boxes))
 
 
+# https://github.com/ailias/Focal-Loss-implement-on-Tensorflow/blob/master/focal_loss.py
+def focal_loss(logits, labels, alpha=0.25, gamma=2):
+	# labels are one-hot encode float type
+	# [N, num_classes]
+	assert len(logits.shape) == 2
+	assert len(labels.shape) == 2
 
-def focal_loss(logits,labels,alpha=0.25, gamma=2):
-	# labels are one-hot encode
-	# [-1, num_classes]
 	sigmoid_p = tf.nn.sigmoid(logits)
-	zeros = tf.zeros_like(sigmoid_p,dtype=sigmoid_p.dtype)
+
+	zeros = tf.zeros_like(sigmoid_p, dtype=sigmoid_p.dtype)
 
 	pos_p_sub = tf.where(labels > zeros, labels - sigmoid_p, zeros)
 
-	neg_p_sub = tf.where(labels > zeros, zeros, labels - sigmoid_p)
+	neg_p_sub = tf.where(labels > zeros, zeros, sigmoid_p)
 
 	focal_loss = - alpha * (pos_p_sub ** gamma) * tf.log(tf.clip_by_value(sigmoid_p, 1e-8, 1.0)) - (1 - alpha) * (neg_p_sub ** gamma) * tf.log(tf.clip_by_value(1.0 - sigmoid_p, 1e-8, 1.0))
 
 	return tf.reduce_sum(focal_loss)
+
+def deformable_conv2d(inputs, offset, ch_out, kernel_size=3, activation=tf.identity, use_bias=True, W_init=None, data_format="NHWC", scope="deformable"):
+	with tf.variable_scope(scope):		
+		if data_format == "NCHW": # need NHWC
+			inputs = tf.transpose(inputs, [0, 2, 3, 1])
+			offset = tf.transpose(offset, [0, 2, 3, 1])
+		in_shape = inputs.get_shape().as_list()
+		in_channel = in_shape[3]
+		input_h, input_w = tf.shape(inputs)[1], tf.shape(inputs)[2]
+
+		shape = (kernel_size, kernel_size, in_channel, ch_out)
+		kernel_n = shape[0] * shape[1]
+
+		# [3x3, 2] local offset
+		# (0, 0), (0, 1) ...
+		# (1, 0), (1, 1) ..
+		# ..
+		initial_offset = tf.stack(
+			tf.meshgrid(tf.range(shape[0]), tf.range(shape[1]), indexing='ij')
+		)
+		# [3x3, 2]
+		initial_offset = tf.reshape(initial_offset, (-1, 2))
+		# [1, 1, 3x3, 2]
+		initial_offset = tf.expand_dims(tf.expand_dims(initial_offset, 0), 0) 
+		# [h, w, 3x3, 2]
+		initial_offset = tf.tile(initial_offset, [input_h, input_w, 1, 1])
+		initial_offset = tf.cast(initial_offset, "float32")
+
+		grid = tf.meshgrid(
+			tf.range(-int((shape[0] - 1) / 2.0), input_h - int((shape[0] - 1) / 2.0), 1),
+			tf.range(-int((shape[0] - 1) / 2.0), input_w - int((shape[0] - 1) / 2.0), 1), indexing='ij'
+		)
+		#[h, w, 2] # each h, w location?
+		grid = tf.stack(grid, axis=-1)
+		grid = tf.cast(grid, 'float32')
+		grid = tf.expand_dims(grid, 2)
+		# [h, w, 3*3, 2]
+		grid = tf.tile(grid, [1, 1, kernel_n, 1])
+		grid_offset = grid + initial_offset
+
+		# [b, h, w, 3x3, c]
+		input_deform = _tf_batch_map_offsets(inputs, offset, grid_offset)
+
+		if W_init is None:
+			W_init = tf.variance_scaling_initializer(scale=2.0)
+		W = tf.get_variable(name="W", shape=[shape[0], shape[1], shape[-2], shape[-1]], initializer=W_init)
+
+		W = tf.reshape(W, [1, 1, shape[0]*shape[1], shape[-2], shape[-1]])
+
+		output = tf.nn.conv3d(input_deform, W, strides=[1, 2, 2, 1, 1], data_format="NDHWC", padding="VALID", name=None)
+		# output is [b, new_h, new_w, 1, c]
+		
+		output = tf.squeeze(output, axis=3) # [b, h, w, c]
+		if data_format == "NCHW":
+			output = tf.transpose(output, [0, 3, 1, 2])
+
+		if use_bias:
+			b_init = tf.constant_initializer()
+			b = tf.get_variable('b', [ch_out], initializer=b_init)
+			output = tf.nn.bias_add(output, b, data_format=data_format)
+
+		output = activation(output, name="output")
+		return output
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 

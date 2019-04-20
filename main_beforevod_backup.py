@@ -9,10 +9,10 @@ import numpy as np
 
 import cv2
 
-from models import get_model
+from models import get_model,get_model_boxfeat,get_model_givenbox
 from trainer import Trainer
 from tester import Tester
-import math, time, json, random, operator
+import math,time,json,random,operator
 import cPickle as pickle
 
 import tensorflow as tf
@@ -20,9 +20,9 @@ import pycocotools.mask as cocomask
 
 from tqdm import tqdm
 from models import fill_full_mask, resizeImage
-from utils import evalcoco, get_op_tensor_name, match_detection, computeAP, computeAR, computeAR_2, grouper, gather_dt, gather_gt, match_dt_gt, gather_act_singles, aggregate_eval, weighted_average
+from utils import evalcoco,get_op_tensor_name,match_detection,computeAP,computeAR,computeAR_2,grouper,gather_dt,gather_gt,match_dt_gt,gather_act_singles,aggregate_eval,weighted_average
 
-from utils import Dataset, Summary, nms_wrapper, FIFO_ME
+from utils import Dataset,Summary, nms_wrapper, FIFO_ME
 
 from nn import soft_nms, nms
 
@@ -32,8 +32,6 @@ def get_args():
 
 	parser.add_argument("datajson")
 	parser.add_argument("imgpath")
-
-	parser.add_argument("--log_time_and_gpu", action="store_true")
 
 	parser.add_argument("--outbasepath",type=str,default=None,help="full path will be outbasepath/modelname/runId")
 
@@ -47,7 +45,6 @@ def get_args():
 	parser.add_argument("--exit_after_val",action="store_true")
 
 	parser.add_argument("--forward_skip",type=int,default=1,help="forward, skip how many.")
-	parser.add_argument("--start_from",type=int,default=0,help="forward, start from which batch")
 
 	parser.add_argument("--modelname",type=str,default=None)
 	parser.add_argument("--num_class",type=int,default=81,help="num catagory + 1 background")
@@ -113,29 +110,21 @@ def get_args():
 
 	parser.add_argument("--resnet152",action="store_true",help="")
 	parser.add_argument("--resnet50",action="store_true",help="")
-	parser.add_argument("--resnet34",action="store_true",help="")
-	parser.add_argument("--resnet18",action="store_true",help="")
-	parser.add_argument("--use_se",action="store_true",help="use squeeze and excitation in backbone")
 
 	parser.add_argument("--is_fpn",action="store_true")
 	parser.add_argument("--use_gn",action="store_true", help="whether to use group normalization")
 	parser.add_argument("--ignore_gn_vars",action="store_true", help="add gn to previous model, will ignore loading the gn var first")
 	parser.add_argument("--use_conv_frcnn_head", action="store_true",help="use conv in fastrcnn head")
-	parser.add_argument("--use_att_frcnn_head", action="store_true",help="use attention to sum [K, 7, 7, C] feature into [K, C]")
-	parser.add_argument("--use_frcnn_class_agnostic", action="store_true", help="use class agnostic fc head")
 	parser.add_argument("--conv_frcnn_head_dim", default=256, type=int)
 
 	parser.add_argument("--get_rpn_out", action="store_true")
 	parser.add_argument("--rpn_out_path",default=None)
 
 	parser.add_argument("--use_cpu_nms",action="store_true")
-	parser.add_argument("--no_nms", action="store_true", help="not using nms in the end, save all pre_nms_topk boxes;")
-	parser.add_argument("--save_all_box",action="store_true", help="for DCR experiment, save all boxes and scores in npz file")
+	parser.add_argument("--use_soft_nms",action="store_true")
 
 	parser.add_argument("--use_small_object_head", action="store_true")
 	parser.add_argument("--use_so_score_thres", action="store_true", help="use score threshold before final nms")
-	parser.add_argument("--oversample_so_img", action="store_true")
-	parser.add_argument("--oversample_x", type=int, default=1, help="x + 1 times")
 	parser.add_argument("--skip_no_so_img", action="store_true")
 	parser.add_argument("--skip_no_object", default=None,help="'Bike', single object annotation filter")
 	parser.add_argument("--so_outpath",default=None)
@@ -228,11 +217,10 @@ def get_args():
 	parser.add_argument("--use_mixup", action="store_true")
 	parser.add_argument("--use_constant_mixup_weight", action="store_true")
 	parser.add_argument("--mixup_constant_weight", type=float, default=0.5)
-	parser.add_argument("--mixup_chance", type=float, default=0.5, help="the possibility of using mixup")
-	parser.add_argument("--max_mixup_per_frame", type=int, default=15)
 
 	# not used for fpn
 	parser.add_argument("--small_anchor_exp",action="store_true")
+
 
 	parser.add_argument("--positive_anchor_thres",default=0.7,type=float)
 	parser.add_argument("--negative_anchor_thres",default=0.3,type=float)
@@ -265,14 +253,13 @@ def get_args():
 	#parser.add_argument("--learning_rate_decay_examples",default=1000000,type=int,help=("how many sample to have one decay"))
 	parser.add_argument("--num_epoch_per_decay",default=2.0,type=float,help=("how epoch after which lr decay"))
 	parser.add_argument("--use_cosine_and_warm_up",action="store_true")
-	parser.add_argument("--warm_up_steps",default=3000,type=int,help=("warm up steps not epochs"))
-	parser.add_argument("--same_lr_steps",default=0,type=int,help=("after warm up, keep the init_lr for k steps"))
+	parser.add_argument("--warm_up_steps",default=1000,type=int,help=("warm up steps not epochs"))
+
 	
 	parser.add_argument("--optimizer",default="adam",type=str,help="optimizer: adam/adadelta")
 	parser.add_argument("--momentum",default=0.9,type=float)
 
 	parser.add_argument("--result_score_thres",default=0.0001,type=float)
-	parser.add_argument("--result_per_im",default=100,type=int)
 
 	# clipping, suggest 100.0
 	parser.add_argument("--clip_gradient_norm",default=None,type=float,help=("norm to clip gradient to")) 
@@ -284,13 +271,6 @@ def get_args():
 
 	args = parser.parse_args()
 
-	if args.use_cosine_and_warm_up:
-		args.use_lr_decay = True
-	if args.save_all_box:
-		args.no_nms = True
-
-	if args.no_nms:
-		args.use_cpu_nms = True # so to avoid using TF nms in the graph
 	assert args.model_per_gpu == 1, "not work yet!"
 	assert args.gpu*args.model_per_gpu == args.im_batch_size # one gpu one image
 	#args.controller = "/cpu:0" # parameter server
@@ -385,8 +365,12 @@ def get_args():
 	if args.is_fpn:
 		args.anchor_strides = (4, 8, 16, 32, 64)
 
-		# we will pad H,W to be zheng chu by 32
 		args.fpn_resolution_requirement = float(args.anchor_strides[3]) # [3] is 32, since there is a total pixel reduce of 2x2x2x2x2 
+
+		if args.use_dilations:
+			args.anchor_strides = (4, 8, 16, 32, 64)
+			args.anchor_sizes = (32, 64, 128, 256, 512)
+			args.fpn_resolution_requirement = 16.0 # no stride in res5
 		
 		args.max_size = np.ceil(args.max_size / args.fpn_resolution_requirement) * args.fpn_resolution_requirement
 
@@ -416,17 +400,10 @@ def get_args():
 	# ---- all the mask rcnn config
 
 	args.resnet_num_block = [3, 4, 23, 3] # resnet 101
-	args.use_basic_block = False # for resnet-34 and resnet-18
 	if args.resnet152:
 		args.resnet_num_block = [3, 8, 36, 3]
 	if args.resnet50:
 		args.resnet_num_block = [3, 4, 6, 3]
-	if args.resnet34:
-		args.resnet_num_block = [3, 4, 6, 3]
-		args.use_basic_block = True
-	if args.resnet18:
-		args.resnet_num_block = [2, 2, 2, 2]
-		args.use_basic_block = True
 
 	#args.short_edge_size = 800
 	#args.max_size = 1333
@@ -465,14 +442,10 @@ def get_args():
 
 	#args.rpn_test_post_nms_topk = 700 #1300 # 700 takes 40 hours, # OOM at 1722,28,28,1024 # 800 OOM for gpu4
 	#args.fastrcnn_nms_thres = 0.5
-	#args.fastrcnn_nms_iou_thres = 0.5 # 0.3 is worse
+	#args.fastrcnn_nms_iou_thres = 0.5 # 0.3?
 
 	#args.result_score_thres = 0.0001
-	#args.result_per_im = 100 # 400 # 100
-
-	if args.focal_loss and args.clip_gradient_norm is None:
-		print "Focal loss needs gradient clipping or will have NaN loss"
-		sys.exit()
+	args.result_per_im = 100 # 400 # 100
 
 	return args
 
@@ -507,6 +480,8 @@ eval_target = {
 
 eval_best = "Person" # not used anymore, we use average as the best metric
 
+
+
 # load all ground truth into memory
 def read_data_diva(config, idlst, framepath, annopath, tococo=False, randp=None, is_train=False):
 	assert idlst is not None
@@ -523,9 +498,7 @@ def read_data_diva(config, idlst, framepath, annopath, tococo=False, randp=None,
 	if randp is not None:
 		imgs = random.sample(imgs,int(len(imgs)*randp))
 
-	data = {"imgs":[], "gt":[]}
-	if config.use_mixup and is_train:
-		data['mixup_weights'] = []
+	data = {"imgs":[], "gt":[], 'mixup_weights':[]}
 
 	print "loading data.."
 	if config.print_params:
@@ -579,7 +552,7 @@ def read_data_diva(config, idlst, framepath, annopath, tococo=False, randp=None,
 			anno['boxes'] = anno['actboxes']
 
 		# labels are one word, diva classname
-		videoname = img.strip().split("_F_")[0]
+
 		labels = []
 		boxes = []
 		no_so_box = True
@@ -598,18 +571,12 @@ def read_data_diva(config, idlst, framepath, annopath, tococo=False, randp=None,
 					no_object = False
 
 		if config.use_mixup and is_train:
-			mixup_boxes = []
-			mixup_labels = []
-			for i, classname in enumerate(list(anno['mixup_labels'])[:config.max_mixup_per_frame]):
+			anno['mixup_boxes'] = [] # just for croping images
+			for i, classname in enumerate(list(anno['mixup_labels'])):
 				if targetClass2id.has_key(classname):
-					# not adding now, during run time will maybe add them
-					#labels.append(targetClass2id[classname])
-					#boxes.append(anno['mixup_boxes'][i])
-
-					mixup_boxes.append(anno['mixup_boxes'][i])
-					mixup_labels.append(targetClass2id[classname])
-			anno['mixup_boxes'] = np.array(mixup_boxes, dtype="float32")
-			anno['mixup_labels'] = mixup_labels
+					labels.append(targetClass2id[classname])
+					boxes.append(anno['mixup_boxes'][i])
+					anno['mixup_boxes'].append(anno['mixup_boxes'][i])
 
 		anno['boxes'] = np.array(boxes,dtype="float32")
 		anno['labels'] = labels
@@ -624,13 +591,8 @@ def read_data_diva(config, idlst, framepath, annopath, tococo=False, randp=None,
 			if no_object:
 				continue
 
-		assert len(anno['labels']) == len(anno['boxes']), (anno['labels'], anno['boxes'])
+		assert len(anno['labels']) == len(anno['boxes']),(anno['labels'],anno['boxes'])
 		assert anno['boxes'].dtype == np.float32
-
-		if config.oversample_so_img and is_train and not no_so_box:
-			for i in xrange(config.oversample_x):
-				data['imgs'].append(os.path.join(framepath, videoname, "%s.jpg"%img))
-				data['gt'].append(anno)
 
 		# statics
 		if config.show_stat:
@@ -695,15 +657,14 @@ def read_data_diva(config, idlst, framepath, annopath, tococo=False, randp=None,
 		if config.use_mixup and is_train:
 			# the training lst and annotation is framename_M_framename.npz files
 			framename1, framename2 = img.strip().split("_M_")
-			videoname1 = framename1.strip().split("_F_")[0]
-			videoname2 = framename2.strip().split("_F_")[0]
-			data['imgs'].append((os.path.join(framepath, videoname1,"%s.jpg"%framename1), os.path.join(framepath, videoname2,"%s.jpg"%framename2)))
+			data['imgs'].append((os.path.join(framepath,videoname,"%s.jpg"%framename1), os.path.join(framepath,videoname,"%s.jpg"%framename2)))
 			data['gt'].append(anno)
 			weight = np.random.beta(1.5, 1.5)
 			if config.use_constant_mixup_weight:
 				weight = config.mixup_constant_weight
 			data['mixup_weights'].append(weight)
 		else:
+			videoname = img.strip().split("_F_")[0]
 			data['imgs'].append(os.path.join(framepath,videoname,"%s.jpg"%img))
 			data['gt'].append(anno)
 
@@ -782,9 +743,7 @@ def train_diva(config):
 	if config.diva_class3:
 		# only care certain classes
 		#eval_target = ["Vehicle","Person","Construction_Barrier","Door","Dumpster","Prop","Push_Pulled_Object","Bike","Parking_Meter"]
-		#eval_target = ["Vehicle", "Person", "Prop", "Push_Pulled_Object", "Bike", "Construction_Vehicle"]
-		# removed construction vehicle 03/2019
-		eval_target = ["Vehicle", "Person", "Prop", "Push_Pulled_Object", "Bike"]
+		eval_target = ["Vehicle", "Person", "Prop", "Push_Pulled_Object", "Bike", "Construction_Vehicle"]
 		eval_target = {one:1 for one in eval_target}
 		eval_target_weight = {one:1.0/len(eval_target) for one in eval_target}
 
@@ -797,6 +756,8 @@ def train_diva(config):
 
 	if config.act_as_obj:
 		eval_target = ["vehicle_turning_right","vehicle_turning_left","Unloading","Transport_HeavyCarry","Opening","Open_Trunk","Loading","Exiting","Entering","Closing_Trunk","Closing","Interacts","Pull","Riding","Talking","activity_carrying","specialized_talking_phone","specialized_texting_phone"] # "vehicle_u_turn" is not used since not exists in val set
+
+		
 
 		eval_target = {one:1 for one in eval_target}
 		eval_target_weight ={one:1.0/len(eval_target) for one in eval_target}
@@ -878,7 +839,7 @@ def train_diva(config):
 		isStart = True
 
 		best = (-1.0,1)
-		loss_me, wd_me, rpn_label_loss_me, rpn_box_loss_me, fastrcnn_label_loss_me, fastrcnn_box_loss_me, so_label_loss_me, act_loss_me, lr_me = [FIFO_ME(config.loss_me_step) for i in xrange(9)]
+		loss_me, wd_me, rpn_label_loss_me, rpn_box_loss_me, fastrcnn_label_loss_me, fastrcnn_box_loss_me, so_label_loss_me, act_loss_me = [FIFO_ME(config.loss_me_step) for i in xrange(8)]
 		for batch in tqdm(train_data.get_batches(config.im_batch_size,num_batches=num_steps),total=num_steps,ascii=True,smoothing=1):
 
 			global_step = sess.run(models[0].global_step) + 1 # start from 0 or the previous step
@@ -952,7 +913,6 @@ def train_diva(config):
 
 								if config.use_cpu_nms:
 									boxes, labels, probs = nms_wrapper(boxes, probs, config)
-
 							
 							val_batch = val_batches[i]
 
@@ -1097,7 +1057,7 @@ def train_diva(config):
 
 			try:
 				#loss, rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss, train_op,act_losses = trainer.step(sess,batch)
-				loss, wds, rpn_label_losses, rpn_box_losses, fastrcnn_label_losses, fastrcnn_box_losses, so_label_losses, act_losses, lr = trainer.step(sess,batch)
+				loss, wds, rpn_label_losses, rpn_box_losses, fastrcnn_label_losses, fastrcnn_box_losses, so_label_losses, act_losses = trainer.step(sess,batch)
 			except Exception as e:
 				print e
 				bs = batch[1]
@@ -1114,7 +1074,6 @@ def train_diva(config):
 			# use moving average to compute loss
 
 			loss_me.put(loss)
-			lr_me.put(lr)
 			for wd, rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss, so_label_loss, act_loss in zip(wds, rpn_label_losses, rpn_box_losses, fastrcnn_label_losses, fastrcnn_box_losses, so_label_losses, act_losses):
 				wd_me.put(wd)
 				rpn_label_loss_me.put(rpn_label_loss)
@@ -1125,7 +1084,7 @@ def train_diva(config):
 				act_loss_me.put(act_loss)
 
 			if global_step % config.show_loss_period == 0:
-				tqdm.write("step %s, moving average: learning_rate %.6f, loss %.6f, weight decay loss %.6f, rpn_label_loss %.6f, rpn_box_loss %.6f, fastrcnn_label_loss %.6f, fastrcnn_box_loss %.6f, so_label_loss %.6f, act_loss %.6f" % (global_step, lr_me.me(), loss_me.me(), wd_me.me(), rpn_label_loss_me.me(), rpn_box_loss_me.me(), fastrcnn_label_loss_me.me(), fastrcnn_box_loss_me.me(), so_label_loss_me.me(), act_loss_me.me()))
+				tqdm.write("step %s, moving average: loss %.6f, weight decay loss %.6f, rpn_label_loss %.6f, rpn_box_loss %.6f, fastrcnn_label_loss %.6f, fastrcnn_box_loss %.6f, so_label_loss %.6f, act_loss %.6f" % (global_step, loss_me.me(), wd_me.me(), rpn_label_loss_me.me(), rpn_box_loss_me.me(), fastrcnn_label_loss_me.me(), fastrcnn_box_loss_me.me(), so_label_loss_me.me(), act_loss_me.me()))
 
 			# save these for ploting later
 			stats.append({
@@ -1133,7 +1092,6 @@ def train_diva(config):
 				"l":float(loss),
 				"val":validation_performance
 			})
-			isStart = False
 
 		# save the last model
 		if global_step % config.save_period != 0: # time to save model
@@ -1229,7 +1187,7 @@ def boxfeat(config):
 			feed_dict = model.get_feed_dict(image,boxes)
 
 			if config.boxclass:
-				feature, label_probs = sess.run([model.feature,model.label_probs],feed_dict=feed_dict)
+				feature,label_probs = sess.run([model.feature,model.label_probs],feed_dict=feed_dict)
 			else:
 				feature, = sess.run([model.feature],feed_dict=feed_dict)
 
@@ -1369,7 +1327,6 @@ def forward(config):
 		all_images = all_images[::config.forward_skip]
 		print "skiiping %s, got %s/%s"%(config.forward_skip, len(all_images), ori_num)
 
-
 	print "total images to test:%s"%len(all_images)
 
 	if config.use_small_object_head:
@@ -1420,12 +1377,7 @@ def forward(config):
 		# num_epoch should be 1
 		assert config.num_epochs == 1
 
-		count=0
 		for images in tqdm(grouper(all_images,config.im_batch_size),ascii=True):
-			count+=1
-			if config.start_from > 0:
-				if count <= config.start_from:
-					continue
 			images = [im for im in images if im is not None]
 			# multigpu will need full image inpu
 			this_batch_len = len(images)
@@ -1558,48 +1510,10 @@ def forward(config):
 									final_boxes, final_labels, final_probs = output
 
 						if config.use_cpu_nms:
-							if not config.no_nms:
-								final_boxes, final_labels, final_probs = nms_wrapper(final_boxes, final_probs, config)
+							final_boxes, final_labels, final_probs = nms_wrapper(final_boxes, final_probs, config)
 
 					final_boxes = final_boxes / scale
-					final_masks = [None for one in final_boxes]
-
-					if config.no_nms:
-						# will leave all K boxes, each box class is the max prob class
-						# final_boxes would be [num_class-1, K, 4]
-						# final_probs would be [num_class-1, K]
-						# final_labels is actually rcnn_boxes, [K, 4]
-						if config.save_all_box: # save all output as npz file instead
-							rcnn_boxes = final_labels
-							rcnn_boxes = rcnn_boxes / scale
-							# boxes are [x1, y1, x2, y2]
-							if config.use_frcnn_class_agnostic:
-								if len(final_boxes) > 0:
-									assert final_boxes[0, 1, 2] == final_boxes[1, 1, 2]
-
-									final_boxes = final_boxes[0, :, :] # [K, 4]
-							data = {
-								"rcnn_boxes": rcnn_boxes, # [K, 4]
-								"frcnn_boxes": final_boxes, # [C, K, 4] / [K, 4]
-								"frcnn_probs": final_probs, # [C, K] # C is num_class -1
-							}
-							target_file = os.path.join(config.outbasepath, "%s.npz"%imagename)
-							np.savez(target_file, **data)
-							continue # next image
-						else: 
-							num_cat, num_box = final_boxes.shape[:2]
-							# [K]
-							best_cat = np.argmax(final_probs, axis=0)
-							# get the final labels first
-							final_labels = best_cat + 1 
-							
-							# use the final boxes, select the best cat for each box
-							final_boxes2 = np.zeros([num_box, 4], dtype="float")
-							for i in xrange(num_box):
-								final_boxes2[i, :] = final_boxes[best_cat[i], i, :]
-							final_boxes = final_boxes2
-							final_probs = np.amax(final_probs, axis=0) # [K]
-							final_masks = [None for one in final_boxes]
+					final_masks = [None for one in final_boxes]	
 
 				pred = []
 
@@ -1608,7 +1522,7 @@ def forward(config):
 					box[3] -= box[1] # produce x,y,w,h output
 
 					if config.diva_class or config.diva_class2 or config.diva_class3:
-						cat_id = int(label)
+						cat_id = label
 						cat_name = targetid2class[cat_id]
 					else:
 						cat_id = config.classId_to_cocoId[label]
@@ -1622,7 +1536,7 @@ def forward(config):
 
 					res = {
 						"category_id":cat_id,
-						"cat_name":cat_name, # [0-80]
+						"cat_name":cat_name, #[0-80]
 						"score":float(round(prob, 4)),
 						"bbox": list(map(lambda x:float(round(x,1)),box)),
 						"segmentation":rle,
@@ -2004,7 +1918,7 @@ def test(config):
 							
 						g = gt[imageid][cat_id]
 
-						dm,gm = match_detection(d, g, cocomask.iou(d,g,[0 for _ in xrange(len(g))]),iou_thres=0.5)
+						dm,gm = match_detection(d,g,cocomask.iou(d,g,[0 for _ in xrange(len(g))]),iou_thres=0.5)
 
 						ap = computeAP(dm)
 						ar = computeAR(dm,gm,recall_k=10)
@@ -2081,7 +1995,7 @@ def initialize(load,load_best,config,sess):
 		allvars = tf.global_variables()
 		allvars = [var for var in allvars if "global_step" not in var.name]
 		#restore_vars = allvars
-		opts = ["Adam","beta1_power","beta1_power_1","beta2_power","beta2_power_1","Adam_1","Adadelta_1","Adadelta","Momentum"]
+		opts = ["Adam","beta1_power","beta2_power","Adam_1","Adadelta_1","Adadelta","Momentum"]
 		
 			
 		allvars = [var for var in allvars if var.name.split(":")[0].split("/")[-1] not in opts]
@@ -2164,8 +2078,8 @@ def initialize(load,load_best,config,sess):
 					if len(not_used) > 0:
 						print "warning, %s/%s in npz not restored:%s"%(len(weights.keys()) - len(intersect), len(weights.keys()), not_used)
 
-					#if config.show_restore:			
-					#	print "loaded %s vars:%s"%(len(intersect),intersect)
+					if config.show_restore:			
+						print "loaded %s vars:%s"%(len(intersect),intersect)
 						
 
 				else:
@@ -2191,34 +2105,12 @@ def mkdir(path):
 	if not os.path.exists(path):
 		os.makedirs(path)
 
-import threading
-from utils import parse_nvidia_smi, sec2time
-
-gpu_util_logs = []
-gpu_temp_logs = []
-
-# use nvidia-smi to 
-def log_gpu_util(interval, gpuid_range):
-	global gpu_util_logs
-	while True:
-		time.sleep(interval)
-		gpu_temps, gpu_utils = parse_nvidia_smi(gpuid_range)
-		gpu_util_logs.extend(gpu_utils)
-		gpu_temp_logs.extend(gpu_temps)
-
 if __name__ == "__main__":
 	config = get_args()
 
 	if config.is_pack_model:
 		pack(config)
 	else:
-		if config.log_time_and_gpu:
-			gpu_log_interval = 10 # every k seconds
-			start_time = time.time()
-			gpu_check_thread = threading.Thread(target=log_gpu_util, args=[gpu_log_interval, (config.gpuid_start, config.gpu)])
-			gpu_check_thread.daemon = True
-			gpu_check_thread.start()
-
 		if config.mode == "train":
 			train_diva(config)
 		elif config.mode == "test":
@@ -2233,14 +2125,3 @@ if __name__ == "__main__":
 			videofeat(config)
 		else:
 			raise Exception("mode %s not supported"%(config.mode))
-
-		if config.log_time_and_gpu:
-			end_time = time.time()
-			print "total run time %s, log gpu utilize every %s seconds and get median %.2f%% and average %.2f%%. GPU temperature median %.2f and average %.2f (C)" % (
-				sec2time(end_time - start_time),
-				gpu_log_interval,
-				np.median(gpu_util_logs)*100,
-				np.mean(gpu_util_logs)*100,
-				np.median(gpu_temp_logs),
-				np.mean(gpu_temp_logs),
-			)

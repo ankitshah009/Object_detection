@@ -1,69 +1,4 @@
 # coding=utf-8
-# model class for semantic features
-
-
-import tensorflow as tf
-from utils import Dataset,get_all_anchors,draw_boxes,box_wh_to_x1x2
-import numpy as np
-import cv2
-from nn import * # yikes
-import math,random,sys,os,itertools
-import tensorflow.contrib.slim as slim
-from nn import pretrained_resnet_conv4,conv2d,deconv2d,resnet_conv5,dense, pairwise_iou,get_iou_callable
-
-# this is for ugly batch norm
-from nn import is_training
-
-from PIL import Image
-
-# ------------------------------ multi gpu stuff
-PS_OPS = [
-	'Variable', 'VariableV2', 'AutoReloadVariable', 'MutableHashTable',
-	'MutableHashTableOfTensors', 'MutableDenseHashTable'
-]
-	
-# see https://github.com/tensorflow/tensorflow/issues/9517
-def assign_to_device(compute_device, controller_device): # ps: paramter server
-	"""Returns a function to place variables on the ps_device.
-
-	Args:
-		device: Device for everything but variables
-		ps_device: Device to put the variables on. Example values are /GPU:0 and /CPU:0.
-
-	If ps_device is not set then the variables will be placed on the default device.
-	The best device for shared varibles depends on the platform as well as the
-	model. Start with CPU:0 and then test GPU:0 to see if there is an
-	improvement.
-	"""
-	def _assign(op):
-		node_def = op if isinstance(op, tf.NodeDef) else op.node_def
-		if node_def.op in PS_OPS:
-			return controller_device
-		else:
-			return compute_device
-	return _assign
-
-
-#----------------------------------
-def get_model(config,gpuid=0,task=0,controller="/cpu:0"):
-	# task is not used
-	#with tf.device("/gpu:%s"%gpuid):
-	with tf.device(assign_to_device("/gpu:%s"%(gpuid), controller)):
-		with tf.variable_scope(tf.get_variable_scope(), reuse=tf.AUTO_REUSE):
-			#tf.get_variable_scope().reuse_variables()
-			model = Mask_RCNN_FPN(config, gpuid=gpuid)
-
-	return model
-
-def get_model_feat(config,gpuid=0,task=0,controller="/cpu:0"):
-	# task is not used
-	#with tf.device("/gpu:%s"%gpuid):
-	with tf.device(assign_to_device("/gpu:%s"%(gpuid), controller)):
-		with tf.variable_scope(tf.get_variable_scope(), reuse=tf.AUTO_REUSE):
-			#tf.get_variable_scope().reuse_variables()
-			model = RCNN_FPN_givenbox(config, gpuid=gpuid)
-
-	return model
 
 class Mask_RCNN_FPN():
 	def __init__(self,config,gpuid=0):
@@ -94,12 +29,6 @@ class Mask_RCNN_FPN():
 		self.gt_boxes = tf.placeholder(tf.float32,[None, 4],name="gt_boxes")
 		self.gt_labels = tf.placeholder(tf.int64,[None,],name="gt_labels")
 
-		self.so_gt_boxes = []
-		self.so_gt_labels = []
-		for i in xrange(len(config.small_objects)):
-			self.so_gt_boxes.append(tf.placeholder(tf.float32,[None, 4],name="so_gt_boxes_c%s"%(i+1)))
-			self.so_gt_labels.append(tf.placeholder(tf.int64,[None,],name="so_gt_labels_c%s"%(i+1)))
-
 		self.gt_mask = tf.placeholder(tf.uint8,[None, None, None],name="gt_masks") # H,W,v -> {0,1}
 
 		# the following will be added in the build_forward and loss
@@ -120,14 +49,17 @@ class Mask_RCNN_FPN():
 		self.multilevel_anchors = []
 		with tf.name_scope("fpn_anchors"):#,tf.device("/cpu:0"):
 			#fm_h,fm_w = tf.shape(image)[0] // config.anchor_stride,tf.shape(image)[1] // config.anchor_stride
+
 			# all posible anchor box coordinates for a given max_size image,
-			# so for 1920 x 1920 image, 1920/16 = 120, so (120,120,NA,4) box, NA is scale*ratio boxes
+			# so for 1920 x 1920 image, 1290/16 = 120, so (120,120,NA,4) box, NA is scale*ratio boxes
 			self.multilevel_anchors = self.get_all_anchors_fpn()
 
-		bgr = True  # cv2 load image is bgr
-		p_image = tf.expand_dims(image,0)  # [1,H,W,C]
 
-		with tf.name_scope("image_preprocess"):  # tf.device("/cpu:0"):
+		bgr = True # cv2 load image is bgr
+		p_image = tf.expand_dims(image,0) #[1,H,W,C]
+		#print image.get_shape()
+		#sys.exit()
+		with tf.name_scope("image_preprocess"):#,tf.device("/cpu:0"):
 			if p_image.dtype.base_dtype != tf.float32:
 				p_image = tf.cast(p_image,tf.float32)
 
@@ -143,7 +75,6 @@ class Mask_RCNN_FPN():
 			image_std = tf.constant(std,dtype=tf.float32)
 			p_image = (p_image - image_mean) / image_std
 			p_image = tf.transpose(p_image,[0, 3, 1, 2])
-
 		self.p_image = p_image
 
 	def get_all_anchors_fpn(self):
@@ -155,8 +86,7 @@ class Mask_RCNN_FPN():
 		
 			anchors.append(anchors_np)
 		return anchors
-	
-	# make the numpy anchor match to the feature shape
+		
 	def slice_feature_and_anchors(self,image_shape2d,p23456,anchors):
 		# anchors is the numpy anchors for different levels
 		config = self.config
@@ -172,6 +102,7 @@ class Mask_RCNN_FPN():
 					pi = p23456[i]
 					target_shape = tf.to_int32(tf.ceil(tf.to_float(image_shape2d) * (1.0 / stride)))
 
+
 					p23456[i] = tf.slice(pi, [0,0,0,0],tf.concat([[-1,-1], target_shape], axis=0))
 					p23456[i].set_shape([1, pi.shape[1], None,None])
 
@@ -183,7 +114,7 @@ class Mask_RCNN_FPN():
 				self.sliced_anchor_labels.append(tf.slice(gt_anchor_labels[i], [0, 0, 0], slice3d))
 				self.sliced_anchor_boxes.append(tf.slice(gt_anchor_boxes[i], [0, 0, 0, 0], slice4d))
 
-	def generate_fpn_proposals(self, multilevel_anchors, multilevel_label_logits, multilevel_box_logits, image_shape2d):
+	def generate_fpn_proposals(self, multilevel_anchors, multilevel_label_logits,multilevel_box_logits, image_shape2d):
 		config = self.config
 		num_lvl = len(config.anchor_strides)
 		assert num_lvl == len(multilevel_anchors)
@@ -303,17 +234,15 @@ class Mask_RCNN_FPN():
 		# TODO: fix global param like data_format and 
 		# [1,C,FS,FS]
 		
-		c2345 = resnet_fpn_backbone(image, config.resnet_num_block, use_gn=config.use_gn, resolution_requirement=config.fpn_resolution_requirement, use_dilations=config.use_dilations, use_deformable=config.use_deformable, tf_pad_reverse=True, freeze=config.freeze, use_basic_block=config.use_basic_block, use_se=config.use_se)
+		c2345 = resnet_fpn_backbone(image,config.resnet_num_block,use_gn=config.use_gn, resolution_requirement=config.fpn_resolution_requirement,tf_pad_reverse=config.new_tensorpack_model,freeze=config.freeze)
 		
-		# include lateral 1x1 conv and final 3x3 conv
-		# -> [7, 7, 256]
-		p23456 = fpn_model(c2345, num_channel=config.fpn_num_channel, use_gn=config.use_gn, scope="fpn")
 
-		if config.freeze_rpn or config.freeze_fastrcnn:
-			p23456 = [tf.stop_gradient(p) for p in p23456]
+		# include lateral 1x1 conv and final 3x3 conv
+		# -> [7,7,256]
+		p23456 = fpn_model(c2345,num_channel=config.fpn_num_channel,use_gn=config.use_gn, scope="fpn")
 
 		# [1, H, W, channel]
-		self.fpn_feature = tf.image.resize_images(tf.transpose(p23456[3], perm=[0, 2, 3, 1]), (7, 7)) # p5 # default bilinear
+		self.fpn_feature = tf.image.resize_images(tf.transpose(p23456[3],perm=[0,2,3,1]), (7,7)) # p5 # default bilinear
 
 		if config.no_obj_detect: # pair with extract_feat, so only extract feature
 			print "no object detect branch.."
@@ -321,29 +250,19 @@ class Mask_RCNN_FPN():
 		# given the numpy anchor for each stride, 
 		# slice the anchor box and label against the feature map size on each level. Again?
 		
-		self.slice_feature_and_anchors(image_shape2d, p23456, multilevel_anchors)
+		self.slice_feature_and_anchors(image_shape2d,p23456,multilevel_anchors)
 		# now multilevel_anchors are sliced and tf type
 		# added sliced gt anchor labels and boxes
 		# so we have each fpn level's anchor boxes, and the ground truth anchor boxes & labels if training
+		if config.obj_v2:
+			p23456 = p23456[:4]
 
 		# given [1,256,FS,FS] feature, each level got len(anchor_ratios) anchor outputs
 		rpn_outputs = [self.rpn_head(pi, config.fpn_num_channel, len(config.anchor_ratios), data_format="NCHW",scope="rpn") for pi in p23456]
 		multilevel_label_logits = [k[0] for k in rpn_outputs]
 		multilevel_box_logits = [k[1] for k in rpn_outputs]
 
-		if config.freeze_rpn:
-			multilevel_label_logits = [tf.stop_gradient(o) for o in multilevel_label_logits]
-			multilevel_box_logits = [tf.stop_gradient(o) for o in multilevel_box_logits]
-
-		# each H,W location has a box regression and classification score, here combine all positive boxes using NMS
-		# [N,4]/[N] , N is the number of proposal boxes
 		proposal_boxes, proposal_scores = self.generate_fpn_proposals(multilevel_anchors, multilevel_label_logits, multilevel_box_logits, image_shape2d)
-
-		# for getting RPN performance
-		# K depend on rpn_test_post_nms_topk during testing
-		# K = 1000
-		self.proposal_boxes = proposal_boxes  # [K, 4]
-		self.proposal_scores = proposal_scores  # [K]
 
 		if config.is_train:
 			gt_boxes = self.gt_boxes
@@ -355,149 +274,109 @@ class Mask_RCNN_FPN():
 		else:
 			rcnn_boxes = proposal_boxes
 
-		# NxCx7x7 # (?, 256, 7, 7)
-		roi_feature_fastrcnn = self.multilevel_roi_align(p23456[:4],rcnn_boxes, 7)
-		
-		if config.use_frcnn_class_agnostic:
-			# (N,num_class), (N, 1, 4)
-			fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_2fc_head_class_agnostic(roi_feature_fastrcnn, config.num_class, boxes=rcnn_boxes, scope="fastrcnn")
+
+		if config.is_cascade_rcnn:
+			if config.is_train:
+				@tf.custom_gradient
+				def scale_gradient(x):
+					return x, lambda dy: dy * (1.0 / config.cascade_num_stage)
+				self.scale_gradient_func = scale_gradient
+				proposals = (rcnn_boxes, rcnn_labels, fg_inds_wrt_gt)
+			else:
+				self.scale_gradient_func = tf.identity
+				proposals = rcnn_boxes
+
+			# cascade to refine region proposal
+			# each step add in groundtruth
+			with tf.variable_scope("cascade_rcnn_stage1"):
+				# [N,num_class] ,[N,1,4]
+				B1_label_logits, B1_box_logits, B1 = self.cascade_rcnn_head(proposals,0,p23456)
+			with tf.variable_scope("cascade_rcnn_stage2"):
+				B1_proposal = self.match_box_with_gt(B1,config.cascade_ious[1])
+				B2_label_logits, B2_box_logits, B2 = self.cascade_rcnn_head(B1_proposal,1,p23456)
+			with tf.variable_scope("cascade_rcnn_stage3"):
+				B2_proposal = self.match_box_with_gt(B2,config.cascade_ious[2])
+				# [N,num_class] ,[N,1,4]
+				B3_label_logits, B3_box_logits, B3 = self.cascade_rcnn_head(B2_proposal,2,p23456)
+
+			cascade_box_proposals = [proposals, B1_proposal, B2_proposal]
+			cascade_box_logits = [B1_box_logits, B2_box_logits, B3_box_logits]
+			cascade_label_logits = [B1_label_logits, B2_label_logits, B3_label_logits]
+
 		else:
-			# (N,num_class), (N, num_class - 1, 4)
-			fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_2fc_head(roi_feature_fastrcnn,config.num_class, boxes=rcnn_boxes, scope="fastrcnn")
-
-		if config.freeze_fastrcnn:
-			fastrcnn_label_logits, fastrcnn_box_logits = tf.stop_gradient(fastrcnn_label_logits), tf.stop_gradient(fastrcnn_box_logits)
-
-		if config.use_small_object_head:
+			# NxCx7x7 # (?, 256, 7, 7)
+			roi_feature_fastrcnn = self.multilevel_roi_align(p23456[:4],rcnn_boxes, 7)
+			# (N,81) ,(N, 80,4)
 			
-			# 1. get all the actual boxes coordinates
-			anchors = tf.tile(tf.expand_dims(rcnn_boxes, 1),[1, config.num_class-1, 1])
-			boxes = decode_bbox_target(fastrcnn_box_logits / tf.constant(config.fastrcnn_bbox_reg_weights, dtype=tf.float32), anchors)
-
-			probs = tf.nn.softmax(fastrcnn_label_logits)
-
-			boxes = tf.transpose(boxes, [1, 0, 2])  # [num_class-1, N, 4]
-			probs = tf.transpose(probs[:, 1:], [1, 0])  # [num_class-1, N]
-
-			small_object_class_ids = [config.classname2id[name] - 1 for name in config.small_objects]
-
-			# C is the number of small object class
-			# [C, N, 4], [C, N]
-			so_boxes, so_scores = tf.gather(boxes, small_object_class_ids), tf.gather(probs, small_object_class_ids)
-
-			# 1. we do NMS for each class to get topk
-
-			# for each catagory get the top K
-			# [C, K, 4] / [C, K]
-			so_boxes, so_scores = tf.map_fn(self.nms_return_boxes, (so_scores, so_boxes), dtype=(tf.float32, tf.float32), parallel_iterations=10)
-
-			self.so_boxes = so_boxes
-
-			so_boxes = tf.reshape(so_boxes, [-1, 4])  # [C*K, 4]
-			so_scores = tf.reshape(so_scores, [-1])  # [C*K]
-
-			# [C*K, 256, 7, 7]
-			so_feature = self.multilevel_roi_align(p23456[:4], so_boxes, 7)
-
-			# share the fc part with fast rcnn head
-			with tf.variable_scope("fastrcnn", reuse=tf.AUTO_REUSE):
-				dim = config.fpn_frcnn_fc_head_dim # 1024
-				initializer = tf.variance_scaling_initializer()
-
-				# sharing features
-				# [C*K, dim]
-				hidden = dense(so_feature, dim, W_init=initializer, activation=tf.nn.relu,scope="fc6")
-				hidden = dense(hidden, dim, W_init=initializer, activation=tf.nn.relu,scope="fc7")
-				# [C, K, dim]
-				hidden = tf.reshape(hidden, [len(config.small_objects), -1, dim])
-
-				if config.freeze_fastrcnn:
-					hidden = tf.stop_gradient(hidden)
-
-				if config.use_so_association:
-					ref_class_id = config.classname2id['Person'] - 1 
-					# [N, 4], [N]
-					ref_boxes, ref_scores = boxes[ref_class_id], probs[ref_class_id]
-					
-					# NMS to get a few peron boxes
-					ref_topk = config.so_person_topk # 10
-
-					ref_selection = tf.image.non_max_suppression(ref_boxes, ref_scores, max_output_size=ref_topk, iou_threshold=config.fastrcnn_nms_iou_thres)
-					# [Rr, 4]
-					ref_boxes = tf.gather(ref_boxes, ref_selection)
-					ref_scores = tf.gather(ref_scores, ref_selection)
-					ref_feat = self.multilevel_roi_align(p23456[:4], ref_boxes, 7)
-
-					# share the same fc
-					ref_feat = dense(ref_feat, dim, W_init=initializer, activation=tf.nn.relu, scope="fc6")
-					ref_feat = dense(ref_feat, dim, W_init=initializer, activation=tf.nn.relu, scope="fc7")
-
-					if config.freeze_fastrcnn:
-						ref_feat = tf.stop_gradient(ref_feat)
-
-				# new variable for small object
-				with tf.variable_scope("small_objects"):
-					so_label_logits = [] # each class a head
-
-					for i in xrange(len(config.small_objects)):
-						if config.use_so_association:
-							asso_hidden = hidden[i] + person_object_relation(hidden[i], self.so_boxes[i], ref_boxes, ref_feat, group=16, geo_feat_dim=64, scope="person_object_relation")
-							so_label_logits.append(dense(asso_hidden, 2, W_init=tf.random_normal_initializer(stddev=0.01), scope="small_object_classification_c%s" % (i+1)))
-						else:
-							so_label_logits.append(dense(hidden[i], 2, W_init=tf.random_normal_initializer(stddev=0.01), scope="small_object_classification_c%s"%(i+1)))
-					add_wd(0.0001)
-
-				# [C, K, 2]
-				so_label_logits = tf.stack(so_label_logits, axis=0)
-
+			fastrcnn_label_logits, fastrcnn_box_logits = self.fastrcnn_2fc_head(roi_feature_fastrcnn,config.num_class,boxes=rcnn_boxes,scope="fastrcnn")
+		
 
 		if config.is_train:
 			rpn_label_loss, rpn_box_loss = self.multilevel_rpn_losses(multilevel_anchors, multilevel_label_logits, multilevel_box_logits)
 
-			# rcnn_labels [N_FG + N_NEG] <- index in [N_FG]
-			fg_inds_wrt_sample = tf.reshape(tf.where(rcnn_labels > 0), [-1])
+			
+			if config.is_cascade_rcnn:
+				losses = [rpn_label_loss, rpn_box_loss]
 
-			# for training, maskRCNN only apply on positive box
-			# [N_FG, num_class, 14, 14]
 
-			# [N_FG, 4]
-			# sampled boxes are at least iou with a gt_boxes
-			fg_sampled_boxes = tf.gather(rcnn_boxes, fg_inds_wrt_sample)
-			fg_fastrcnn_box_logits = tf.gather(fastrcnn_box_logits, fg_inds_wrt_sample)
+				for i, proposals in enumerate(cascade_box_proposals):
+					with tf.name_scope('cascade_loss_stage%s'%(i + 1)):
+						this_rcnn_boxes, this_rcnn_labels, this_fg_inds_wrt_gt = cascade_box_proposals[i]
+						this_box_logits = cascade_box_logits[i]
+						this_label_logits = cascade_label_logits[i]
+						reg_weight = config.cascade_bbox_reg[i]
 
-			# [N_FG, 4] # each proposal box assigned gt box, may repeat
-			matched_gt_boxes = tf.gather(gt_boxes, fg_inds_wrt_gt)
+						this_fg_inds_wrt_sample = tf.reshape(tf.where(this_rcnn_labels > 0), [-1])
+						this_fg_sampled_boxes = tf.gather(this_rcnn_boxes, this_fg_inds_wrt_sample)
+						this_fg_fastrcnn_box_logits = tf.gather(this_box_logits, this_fg_inds_wrt_sample)
 
-			# fastrcnn also need to regress box (just the FG box)
-			encoded_boxes = encode_bbox_target(matched_gt_boxes, fg_sampled_boxes) * tf.constant(config.fastrcnn_bbox_reg_weights)  # [10,10,5,5]?
+						this_matched_gt_boxes = tf.gather(self.gt_boxes, this_fg_inds_wrt_gt)
 
-			# fastrcnn input is fg and bg proposal box, do classification to num_class(include bg) and then regress on fg boxes
-			# [N_FG+N_NEG,4] & [N_FG,4]
-			fastrcnn_label_loss, fastrcnn_box_loss = self.fastrcnn_losses(rcnn_labels, fastrcnn_label_logits,encoded_boxes, fg_fastrcnn_box_logits)
+						this_encoded_boxes = encode_bbox_target(this_matched_gt_boxes, this_fg_sampled_boxes) * tf.constant(reg_weight,dtype=tf.float32) 
 
-			# ---------------------------------------------------------
+						this_label_loss, this_box_loss = self.fastrcnn_losses(this_rcnn_labels, this_label_logits, this_encoded_boxes, this_fg_fastrcnn_box_logits)
 
-			# for debug
-			self.rpn_label_loss = rpn_label_loss
-			self.rpn_box_loss = rpn_box_loss
-			self.fastrcnn_label_loss = fastrcnn_label_loss
-			self.fastrcnn_box_loss = fastrcnn_box_loss
+						losses.extend([this_label_loss,this_box_loss])
 
-			losses = [rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss]
+				# for debug
+				self.rpn_label_loss = rpn_label_loss
+				self.rpn_box_loss = rpn_box_loss
+				self.fastrcnn_label_loss = losses[-2]
+				self.fastrcnn_box_loss = losses[-1]
 
-			if config.use_small_object_head:
-				# assume we have the small gt boxes and labels
-				# so_boxes [C, K, 4]
-				# so_label_logits [C, K, 2]
-				# so_labels [C, K] # [0, 1]
-				so_labels = get_so_labels(self.so_boxes, self.so_gt_boxes, self.so_gt_labels, config=config)
 
-				so_label_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=so_labels, logits=so_label_logits)
 
-				so_label_loss = tf.reduce_mean(so_label_loss, name="label_loss")
+			else:#---------------- get fast rcnn loss
 
-				self.so_label_loss = so_label_loss
-				losses.append(so_label_loss)
+				# rcnn_labels [N_FG + N_NEG] <- index in [N_FG]
+				fg_inds_wrt_sample = tf.reshape(tf.where(rcnn_labels > 0), [-1])
+
+				# for training, maskRCNN only apply on positive box
+				# [N_FG, num_class, 14, 14]
+
+				# [N_FG, 4]
+				# sampled boxes are at least iou with a gt_boxes
+				fg_sampled_boxes = tf.gather(rcnn_boxes, fg_inds_wrt_sample)
+				fg_fastrcnn_box_logits = tf.gather(fastrcnn_box_logits, fg_inds_wrt_sample)
+
+				# [N_FG, 4] # each proposal box assigned gt box, may repeat
+				matched_gt_boxes = tf.gather(gt_boxes, fg_inds_wrt_gt)
+
+				# fastrcnn also need to regress box (just the FG box)
+				encoded_boxes = encode_bbox_target(matched_gt_boxes, fg_sampled_boxes) * tf.constant(config.fastrcnn_bbox_reg_weights) #[10,10,5,5]?
+
+				# fastrcnn input is fg and bg proposal box, do classification to num_class(include bg) and then regress on fg boxes
+				# [N_FG+N_NEG,4] & [N_FG,4]
+				fastrcnn_label_loss, fastrcnn_box_loss = self.fastrcnn_losses(rcnn_labels, fastrcnn_label_logits,encoded_boxes, fg_fastrcnn_box_logits)
+				# ---------------------------------------------------------
+
+				# for debug
+				self.rpn_label_loss = rpn_label_loss
+				self.rpn_box_loss = rpn_box_loss
+				self.fastrcnn_label_loss = fastrcnn_label_loss
+				self.fastrcnn_box_loss = fastrcnn_box_loss
+
+				losses = [rpn_label_loss, rpn_box_loss, fastrcnn_label_loss, fastrcnn_box_loss]
 
 
 			# mask rcnn loss
@@ -507,29 +386,27 @@ class Mask_RCNN_FPN():
 
 				# NxCx14x14
 				# only the fg boxes
-				roi_feature_fastrcnn = self.multilevel_roi_align(p23456[:4], fg_sampled_boxes, 14)
+				roi_feature_fastrcnn = self.multilevel_roi_align(p23456[:4],fg_sampled_boxes, 14)
 
 				mask_logits = self.maskrcnn_up4conv_head(fg_feature, config.num_class,scope='maskrcnn')
 
 
 				# [N_FG, H,W]
 				gt_mask = self.gt_mask
-				gt_mask_for_fg = tf.gather(gt_mask, fg_inds_wrt_gt)
+				gt_mask_for_fg = tf.gather(gt_mask,fg_inds_wrt_gt)
 				# [N_FG, H, W] -> [N_FG, 14, 14]
 				target_masks_for_fg = crop_and_resize(
-					tf.expand_dims(gt_masks, 1), 
+					tf.expand_dims(gt_masks,1), 
 					fg_sampled_boxes,
 					fg_inds_wrt_gt, 28, pad_border=False) # fg x 1x28x28
-				target_masks_for_fg = tf.squeeze(target_masks_for_fg, 1)
+				target_masks_for_fg = tf.squeeze(target_masks_for_fg,1)
 
 				mrcnn_loss = self.maskrcnn_loss(mask_logits, fg_labels, target_masks_for_fg)
 
 				losses+=[mrcnn_loss]
 
-			self.wd = None
 			if config.wd is not None:
-				wd = wd_cost('.*/W', config.wd, scope="wd_cost")
-				self.wd = wd
+				wd = wd_cost('.*/W', config.wd,scope="wd_cost")
 				losses.append(wd)
 
 			self.loss = tf.add_n(losses,'total_loss')
@@ -540,70 +417,33 @@ class Mask_RCNN_FPN():
 			# inferencing
 			# K -> proposal box
 			# [K,num_class]
-			# image_shape2d, rcnn_boxes, fastrcnn_label_logits, fastrcnn_box_logits
-					
-			# get the regressed actual boxes
-			if config.use_frcnn_class_agnostic:
-				# box regress logits [K, 1, 4], so we tile it to num_class-1 so the rest is the same
-				fastrcnn_box_logits = tf.tile(fastrcnn_box_logits, [1, config.num_class-1, 1])
-			
-			# anchor box [K,4] -> [K, num_class - 1, 4] <- box regress logits [K, num_class-1, 4]
-			anchors = tf.tile(tf.expand_dims(rcnn_boxes, 1), [1, config.num_class-1, 1])
+			#image_shape2d, rcnn_boxes, fastrcnn_label_logits, fastrcnn_box_logits
+			if config.is_cascade_rcnn:
+				# B3 is already decoded
+				decoded_boxes = tf.expand_dims(B3, 1)     # class-agnostic
+				decoded_boxes = tf.tile(decoded_boxes, [1, self.num_class-1, 1])
 
-			# [K, num_class-1, 4]/ [K, 1, 4]
-			decoded_boxes = decode_bbox_target(fastrcnn_box_logits / tf.constant(config.fastrcnn_bbox_reg_weights, dtype=tf.float32), anchors)		
+				label_probs = []
+				for  i, this_label_logits in enumerate(cascade_label_logits):
+					this_label_prob = tf.nn.softmax(this_label_logits)
+					label_probs.append(this_label_prob)
+
+				label_probs = tf.multiply(tf.add_n(label_probs), (1.0 / config.cascade_num_stage))
+
+			else:				
+				# get the regressed actual boxes
+				# anchor box [K,4] -> [K,num_class - 1, 4] <- box regress logits [K,num_class-1,4]
+				anchors = tf.tile(tf.expand_dims(rcnn_boxes,1),[1, config.num_class-1,1])
+
+				decoded_boxes = decode_bbox_target(fastrcnn_box_logits / tf.constant(config.fastrcnn_bbox_reg_weights,dtype=tf.float32), anchors)
+
+				label_probs = tf.nn.softmax(fastrcnn_label_logits)
 
 			decoded_boxes = clip_boxes(decoded_boxes, image_shape2d, name="fastrcnn_all_boxes")
-
-			label_probs = tf.nn.softmax(fastrcnn_label_logits)
-
-			if config.use_small_object_head:
-				# so_label_logits: [C, N, 2]
-				"""
-				if config.replace_small_object:					
-					# replace some of the scores
-					small_object_class_ids = [config.classname2id[name] for name in config.small_objects]
-					# [N, num_class] 
-					# put each label logit for each class then stack
-					new_label_logits = []
-					for classid in config.classid2name:
-						if classid in small_object_class_ids:
-							so_idx = small_object_class_ids.index(classid)
-							new_label_logits.append(so_label_logits[so_idx, :, 1]) # 1 is the class score and 0 is score for BG
-						else:
-							new_label_logits.append(fastrcnn_label_logits[:, classid])
-					fastrcnn_label_logits = tf.stack(new_label_logits, axis=1)
-				"""
-				
-				# output the small object boxes separately
-				# K is result_per_im=100
-				# 1. so_label_logits is [C, K, 2]
-				# so_boxes [C, K, 4]
-				# reconstruct label logit to be [K, C+1]
-				new_label_logits = []
-				# BG is ignore anyway
-				new_label_logits.append(tf.reduce_mean(so_label_logits[:, :, 0], axis=0)) # [K]
-				for i in xrange(len(config.small_objects)):
-					new_label_logits.append(so_label_logits[i, :, 1])
-				# [K, C+1]
-				so_label_logits = tf.stack(new_label_logits, axis=1)					
-
-				# [K, C, 4]
-				so_boxes = tf.transpose(self.so_boxes, [1, 0, 2])
-
-				so_decoded_boxes = clip_boxes(so_boxes, image_shape2d, name="so_all_boxes")
-
-				so_pred_indices, so_final_probs = self.fastrcnn_predictions(so_decoded_boxes, so_label_logits, no_score_filter=not config.use_so_score_thres)
-				so_final_boxes = tf.gather_nd(so_decoded_boxes, so_pred_indices, name="so_final_boxes")
-
-				so_final_labels = tf.add(so_pred_indices[:, 1], 1, name="so_final_labels")
-				# [R,4]
-				self.so_final_boxes = so_final_boxes
-				# [R]
-				self.so_final_labels = so_final_labels
-				self.so_final_probs = so_final_probs
+				#self.decoded_boxes = decoded_boxes
 
 			if config.use_cpu_nms:
+				# all boxes and scores: [num_class-1, K, 5]
 				boxes = decoded_boxes
 				probs = label_probs
 				assert boxes.shape[1] == config.num_class - 1,(boxes.shape,config.num_class)
@@ -616,7 +456,7 @@ class Mask_RCNN_FPN():
 				self.final_boxes = boxes
 				self.final_probs = probs
 
-				self.final_labels = rcnn_boxes  # just used for compatable with none cpu nms mode
+				self.final_labels = probs  # just used for compatable with none cpu nms mode
 
 				return None # so no TF GPU NMS
 
@@ -626,6 +466,7 @@ class Mask_RCNN_FPN():
 			# here do nms,
 			
 			pred_indices, final_probs = self.fastrcnn_predictions(decoded_boxes, label_probs)
+
 			
 			# [R,4]
 			final_boxes = tf.gather_nd(decoded_boxes, pred_indices, name="final_boxes")
@@ -665,14 +506,14 @@ class Mask_RCNN_FPN():
 		with tf.variable_scope(scope):
 			# [1, channel, FS1, FS2] # channel = 1024
 			# conv0:W -> [3,3,1024,1024]
-			h = conv2d(featuremap,channel, kernel=3, activation=tf.nn.relu, data_format=data_format, W_init=tf.random_normal_initializer(stddev=0.01),scope="conv0")
+			h = conv2d(featuremap,channel,kernel=3,activation=tf.nn.relu,data_format=data_format,W_init=tf.random_normal_initializer(stddev=0.01),scope="conv0")
 			# h -> [1,1024(channel),FS1,FS2]
 
 			# 1x1 kernel conv to classification on each grid
 			# [1, 1024, FS1, FS2] -> # [1, num_anchors, FS1, FS2]
-			label_logits = conv2d(h, num_anchors, 1, data_format=data_format, W_init=tf.random_normal_initializer(stddev=0.01), scope="class")
+			label_logits = conv2d(h,num_anchors,1,data_format=data_format,W_init=tf.random_normal_initializer(stddev=0.01),scope="class")
 			# [1, 1024, FS1, FS2] -> # [1, 4 * num_anchors, FS1, FS2]
-			box_logits = conv2d(h, 4*num_anchors, 1, data_format=data_format, W_init=tf.random_normal_initializer(stddev=0.01), scope="box")
+			box_logits = conv2d(h,4*num_anchors,1,data_format=data_format,W_init=tf.random_normal_initializer(stddev=0.01),scope="box")
 
 			# [1,1024,FS1, FS2] -> [FS1, FS2,1024]
 			label_logits = tf.squeeze(tf.transpose(label_logits, [0,2,3,1]),0)
@@ -684,27 +525,13 @@ class Mask_RCNN_FPN():
 
 			return label_logits,box_logits
 
-	def small_object_classification_head(self, feature, num_class, scope="small_object_classification"):
-		config = self.config
-		dim = config.fpn_frcnn_fc_head_dim # 1024
-		initializer = tf.variance_scaling_initializer()
-
-		with tf.variable_scope(scope):
-			hidden = dense(feature, dim, W_init=initializer, activation=tf.nn.relu,scope="fc6")
-			hidden = dense(hidden, dim, W_init=initializer, activation=tf.nn.relu,scope="fc7")
-			
-			classification = dense(hidden, num_class, W_init=tf.random_normal_initializer(stddev=0.01), scope="class") # [K,num_class]
-			
-		return classification
-
 	# feature: [K,C,7,7] # feature for each roi
-	def fastrcnn_2fc_head(self, feature, num_class=None, boxes=None, scope="fastrcnn_head"):
+	def fastrcnn_2fc_head(self,feature,num_class=None,boxes=None,scope="fastrcnn_head"):
 		config = self.config
 		dim = config.fpn_frcnn_fc_head_dim # 1024
 		initializer = tf.variance_scaling_initializer()
 
 		with tf.variable_scope(scope):
-
 			if config.use_conv_frcnn_head:
 				hidden = self.conv_frcnn_head(feature, dim, config.conv_frcnn_head_dim, num_conv=4, use_gn=config.use_gn)
 			else:
@@ -718,39 +545,26 @@ class Mask_RCNN_FPN():
 					hidden = dense(feature,dim,W_init=initializer,activation=tf.nn.relu,scope="fc6")
 					hidden = dense(hidden,dim,W_init=initializer,activation=tf.nn.relu,scope="fc7")
 
-			# hidden -> [K, dim]
-			if config.use_att_frcnn_head:
-				# changes: 1. conv2d kernel size; 2. softmax/sigmoid; 3. sum or gating?; 4. convert to dim first then attention?; 5. attend then two fc, no use of previous hidden
-				# [K, 7, 7, C]
-				feature = tf.transpose(feature, perm=[0, 2, 3, 1])
-				H, W, feat_dim = feature.get_shape()[1:]
-				# 1. simple conv attention
-				# [K, 7, 7, 1]
-				attention = conv2d(feature, 1, kernel=3, padding="SAME", stride=1, activation=tf.nn.softmax, use_bias=True, data_format="NHWC", W_init=initializer, scope="attention")
-				# [K,7*7, C]
-				feature = tf.reshape(feature, [-1, H*W, feat_dim])
-				attention = tf.reshape(attention, [-1, H*W, 1])
-				# [K, C]
-				attended = tf.reduce_sum(feature * attention, 1)
-
-				# match the dimension
-				attended_feat = dense(attended, dim, W_init=initializer, activation=tf.nn.relu, scope="att_trans")
-
-				# sum with original feature
-				hidden = hidden + attended_feat
 
 			with tf.variable_scope("outputs"):
 
 				classification = dense(hidden,num_class,W_init=tf.random_normal_initializer(stddev=0.01),scope="class") # [K,num_class]
 				
 			
-				box_regression = dense(hidden,num_class*4 ,W_init=tf.random_normal_initializer(stddev=0.001),scope="box")
-				box_regression = tf.reshape(box_regression, (-1, num_class,4))
+				if config.new_tensorpack_model:
+					box_regression = dense(hidden,num_class*4 ,W_init=tf.random_normal_initializer(stddev=0.001),scope="box")
+					box_regression = tf.reshape(box_regression, (-1, num_class,4))
 
-				box_regression = box_regression[:,1:,:]
-				
-				box_regression.set_shape([None,num_class-1,4])
+					box_regression = box_regression[:,1:,:]
 					
+					box_regression.set_shape([None,num_class-1,4])
+				else:
+					box_regression = dense(hidden,(num_class -1)*4, W_init=tf.random_normal_initializer(stddev=0.001),scope="box")
+					
+					box_regression = tf.reshape(box_regression, (-1, num_class-1,4))
+			
+			
+
 		return classification,box_regression
 
 	def conv_frcnn_head(self, feature, fc_dim, conv_dim, num_conv, use_gn=False):
@@ -805,82 +619,44 @@ class Mask_RCNN_FPN():
 			l = conv2d(l,num_class-1, kernel=1, data_format="NCHW", W_init=tf.variance_scaling_initializer(scale=2.0,mode="fan_out",distribution='normal'), scope="conv")
 			return l
 
-
-	def nms_return_masks(self, X):
-		config = self.config
-		prob, box = X # [K], [K,4]
-		output_shape = tf.shape(prob)
-		# [K]
-		ids = tf.reshape(tf.where(prob > config.result_score_thres), [-1])
-		prob_ = tf.gather(prob,ids)
-		box_ = tf.gather(box,ids)
-		# NMS
-		selection = tf.image.non_max_suppression(box_, prob_, max_output_size=config.result_per_im,iou_threshold=config.fastrcnn_nms_iou_thres)
-		selection = tf.to_int32(tf.gather(ids, selection))
-		sorted_selection = -tf.nn.top_k(-selection, k=tf.size(selection))[0]
-
-		mask = tf.sparse_to_dense(sparse_indices=sorted_selection,output_shape=output_shape,sparse_values=True,default_value=False)
-
-		return mask
-	def nms_return_masks_no_score_filter(self, X):
-		config = self.config
-		prob, box = X # [K], [K,4]
-		output_shape = tf.shape(prob)
-		# NMS
-		selection = tf.image.non_max_suppression(box, prob, max_output_size=config.result_per_im,iou_threshold=config.fastrcnn_nms_iou_thres)
-		sorted_selection = -tf.nn.top_k(-selection, k=tf.size(selection))[0]
-
-		mask = tf.sparse_to_dense(sparse_indices=sorted_selection,output_shape=output_shape,sparse_values=True,default_value=False)
-
-		return mask
-
-	def nms_return_boxes(self, X):
-		config = self.config
-		prob, box = X # [K], [K,4]
-		output_shape = tf.shape(prob)
-		# NMS
-		selection = tf.image.non_max_suppression(box, prob, max_output_size=config.result_per_im, iou_threshold=config.fastrcnn_nms_iou_thres)
-		selected_prob = tf.gather(prob, selection)
-		selected_box = tf.gather(box, selection)
-		return selected_box, selected_prob
-
 	# given all proposal box prediction, based on score thres , get final NMS resulting box
 	# [K,num_class-1,4] -> decoded_boxes
 	# [K,num_class] label_probs
 	# each proposal box has prob and box to all class
 	# here using nms for each class, -> [R]
-	def fastrcnn_predictions(self,boxes, probs, no_score_filter=False, scope="fastrcnn_predictions"):
+	def fastrcnn_predictions(self,boxes, probs,scope="fastrcnn_predictions"):
 		with tf.variable_scope(scope):		
 			config = self.config
-
-			#assert boxes.shape[1] == config.num_class - 1,(boxes.shape,config.num_class)
-			#assert probs.shape[1] == config.num_class,(probs.shape[1],config.num_class)
-
-			if config.use_bg_score: # use the BG score to filter out boxes
-				# probs: [K, num_class]
-				box_classes = tf.argmax(probs, axis=1) # [K]
-				# [N]
-				nonBG_box_indices = tf.reshape(tf.where(tf.greater(box_classes, 0)), [-1])
-				probs = tf.gather(probs, nonBG_box_indices)
-				boxes = tf.gather(boxes, nonBG_box_indices)
-
-
+			assert boxes.shape[1] == config.num_class - 1,(boxes.shape,config.num_class)
+			assert probs.shape[1] == config.num_class,(probs.shape[1],config.num_class)
 			# transpose to map_fn along each class
 			boxes = tf.transpose(boxes,[1,0,2]) # [num_class-1, K,4]
 			probs = tf.transpose(probs[:,1:],[1,0]) # [num_class-1, K]
 
+			def f(X):
+				prob,box = X # [K], [K,4]
+				output_shape = tf.shape(prob)
+				# [K]
+				ids = tf.reshape(tf.where(prob > config.result_score_thres),[-1])
+				prob = tf.gather(prob,ids)
+				box = tf.gather(box,ids)
+				# NMS
+				selection = tf.image.non_max_suppression(box,prob,max_output_size=config.result_per_im,iou_threshold=config.fastrcnn_nms_iou_thres)
+				selection = tf.to_int32(tf.gather(ids,selection))
+				sorted_selection = -tf.nn.top_k(-selection, k=tf.size(selection))[0]
+
+				mask = tf.sparse_to_dense(sparse_indices=sorted_selection,output_shape=output_shape,sparse_values=True,default_value=False)
+				return mask
+
 			# for each catagory get the top K
-			# [num_class-1, K]
-			if no_score_filter:
-				masks = tf.map_fn(self.nms_return_masks_no_score_filter, (probs, boxes), dtype=tf.bool, parallel_iterations=10)
-			else:
-				masks = tf.map_fn(self.nms_return_masks, (probs, boxes), dtype=tf.bool, parallel_iterations=10)
-			# [R*(num_class-1),2], each entry is [cat_id,box_id]
+			# [num_class-1, R]
+			masks = tf.map_fn(f, (probs,boxes), dtype=tf.bool, parallel_iterations=10)
+			# [R,2], each entry is [cat_id,box_id]
 			selected_indices = tf.where(masks)
 
-			# [num_class-1, K] -> [R*(num_class-1)] 
-			probs = tf.boolean_mask(probs, masks)  
-			# topk_indices [R]
+			probs = tf.boolean_mask(probs,masks)# [num_class-1, K] 
+
+			# topk_indices [num_class-1,result_num]
 			topk_probs, topk_indices = tf.nn.top_k(probs, tf.minimum(config.result_per_im,tf.size(probs)),sorted=False)
 
 			# [K,2] <- select [act_num,R] 
@@ -888,7 +664,8 @@ class Mask_RCNN_FPN():
 			filtered_selection = tf.reverse(filtered_selection, axis=[1],name="filtered")
 
 			# [R,2], [R,]
-			return filtered_selection, topk_probs
+			return filtered_selection, topk_probs, all_boxes_and_scores
+
 
 	# ---- losses
 	def maskrcnn_loss(self,mask_logits, fg_labels, fg_target_masks,scope="maskrcnn_loss"):
@@ -943,8 +720,8 @@ class Mask_RCNN_FPN():
 		config = self.config
 		with tf.variable_scope(scope):
 			# anchor_label ~ {-1,0,1} , -1 means ignore, , 0 neg, 1 pos
-			# label_logits [FS,FS,num_anchors] 
-			# box_logits [FS,FS,num_anchors,4] 
+			# label_logits [FS,FS,num_anchors] [7,7,1024]
+			# box_logits [FS,FS,num_anchors,4] [7.7,1024,4]
 			
 			#with tf.device("/cpu:0"):
 			valid_mask = tf.stop_gradient(tf.not_equal(anchor_labels, -1)) # 1,0|pos/neg
@@ -952,10 +729,11 @@ class Mask_RCNN_FPN():
 			nr_valid = tf.stop_gradient(tf.count_nonzero(valid_mask, dtype=tf.int32), name="num_valid_anchor")
 			nr_pos = tf.identity(tf.count_nonzero(pos_mask, dtype=tf.int32), name='num_pos_anchor')
 
-			# [nr_valid]
+			# [K1]
+
 			valid_anchor_labels = tf.boolean_mask(anchor_labels,valid_mask)
 
-			# [nr_valid]
+			# [K2]
 			valid_label_logits = tf.boolean_mask(label_logits, valid_mask)
 
 
@@ -963,19 +741,19 @@ class Mask_RCNN_FPN():
 
 			# label loss for all valid anchor box
 			if config.focal_loss:
-				valid_label_logits = tf.reshape(valid_label_logits, [-1, 1])
-				valid_anchor_labels = tf.reshape(valid_anchor_labels, [-1, 1])
-				label_loss = focal_loss(logits=valid_label_logits, labels=tf.to_float(valid_anchor_labels))
+				label_loss = focal_loss(logits=valid_label_logits,labels=tf.to_float(valid_anchor_labels))
 			else:
-				label_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=valid_label_logits, labels=tf.to_float(valid_anchor_labels))
+				label_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=valid_label_logits,labels=tf.to_float(valid_anchor_labels))
+
+				label_loss = tf.reduce_mean(label_loss,name="label_loss")
 
 				label_loss = tf.reduce_sum(label_loss) * (1. / config.rpn_batch_per_im)
 
 			label_loss = tf.where(tf.equal(nr_valid, 0), placeholder, label_loss, name='label_loss')
 
 			# box loss for positive anchor
-			pos_anchor_boxes = tf.boolean_mask(anchor_boxes, pos_mask)
-			pos_box_logits = tf.boolean_mask(box_logits, pos_mask)
+			pos_anchor_boxes = tf.boolean_mask(anchor_boxes,pos_mask)
+			pos_box_logits = tf.boolean_mask(box_logits,pos_mask)
 
 			delta = 1.0/9
 
@@ -986,22 +764,23 @@ class Mask_RCNN_FPN():
 			box_loss = box_loss * (1. / config.rpn_batch_per_im)
 			box_loss = tf.where(tf.equal(nr_pos, 0), placeholder, box_loss, name='box_loss')
 
+
 			return label_loss, box_loss
 
 	def fastrcnn_losses(self, labels, label_logits, fg_boxes, fg_box_logits,scope="fastrcnn_losses"):
 		config = self.config
 		with tf.variable_scope(scope):
-			# label -> label for roi [N_FG + N_NEG], the fg labels are 1-num_class, 0 is bg
+			# label -> label for roi [N_FG + N_NEG]
 			# label_logits [N_FG + N_NEG,num_class]
 			# fg_boxes_logits -> [N_FG,num_class-1,4]
 
 			# so the label is int [0-num_class], 0 being background
 
 			if config.focal_loss:
-				onehot_label = tf.one_hot(labels, label_logits.get_shape()[-1]) # [N, num_classes]
+				onehot_label = tf.one_hot(labels,label_logits.get_shape()[-1])
 
 				# here uses sigmoid
-				label_loss = focal_loss(logits=label_logits, labels=tf.to_float(onehot_label))
+				label_loss = focal_loss(logits=label_logits,labels=tf.to_float(onehot_label))
 			else:
 				label_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=labels, logits=label_logits)
 
@@ -1028,7 +807,7 @@ class Mask_RCNN_FPN():
 
 	# given the image path, and the label for it
 	# preprocess
-	def get_feed_dict(self, batch, is_train=False):
+	def get_feed_dict(self,batch,is_train=False):
 
 		#{"imgs":[],"gt":[]}
 		config = self.config
@@ -1037,40 +816,14 @@ class Mask_RCNN_FPN():
 
 		assert N == 1 # only 1 image for now
 
+		image = batch.data['imgs'][0]
+
 		feed_dict = {}
 
 		if batch.data.has_key("imgdata"):
 			image = batch.data['imgdata'][0]
 		else:
-			image = batch.data['imgs'][0]
-			if config.use_mixup:
-				img1, img2 = image
-				use_mixup = random.random() <= config.mixup_chance
-				if use_mixup:
-					weight = batch.data['mixup_weights'][0]
-					img1 = Image.open(img1)
-					img2 = Image.open(img2)
-					trans_alpha = int(255.0*weight)
-					for mixup_box in batch.data['gt'][0]['mixup_boxes']:
-						box_img = img2.crop(mixup_box)
-						box_img_sizes = [int(a) for a in box_img.size[::-1]]
-						# unit8 and "L" are needed
-						mask = Image.fromarray(np.zeros(box_img_sizes, dtype="uint8") + trans_alpha, mode="L")
-						img1.paste(box_img, mixup_box, mask=mask)
-					# PIL to cv2 image
-					img1 = np.array(img1)
-					img1 = img1[:, :, ::-1].copy()
-
-					# now add the annotation
-					batch.data['gt'][0]['boxes'] = np.concatenate([batch.data['gt'][0]['boxes'], batch.data['gt'][0]['mixup_boxes']], axis=0)
-					batch.data['gt'][0]['labels'].extend(batch.data['gt'][0]['mixup_labels'])
-
-					image = img1
-				else:
-					image = cv2.imread(img1,cv2.IMREAD_COLOR)
-			else:
-				image = cv2.imread(image,cv2.IMREAD_COLOR)
-
+			image = cv2.imread(image,cv2.IMREAD_COLOR)
 			assert image is not None,image
 			image = image.astype("float32")
 		h,w = image.shape[:2] # original width/height
@@ -1109,6 +862,7 @@ class Mask_RCNN_FPN():
 			boxes[:,0] = boxes[:,0] * (neww*1.0/w) # x1,x2
 			boxes[:,1] = boxes[:,1] * (newh*1.0/h) # y1,y2
 
+
 			# random horizontal flip
 			# no flip for surveilance video?
 			if config.flip_image:
@@ -1118,10 +872,12 @@ class Mask_RCNN_FPN():
 					resized_image = cv2.flip(resized_image,1) # 1 for horizontal
 					#boxes[:,0,0] = neww - boxes[:,0,0] - boxes[:,0,1] # for (x,y,w,h)
 					boxes[:,0] = neww - boxes[:,0]
-					boxes[:,0,:] = boxes[:,0,::-1]# (x_min will be x_max after flip)		
+					boxes[:,0,:] = boxes[:,0,::-1]# (x_min will be x_max after flip)
+				
 
 			boxes = boxes.reshape((-1,4))
 			boxes = boxes[:,[0,2,1,3]] #(x1,y1,x2,y2)
+
 
 			# visualize?
 			if config.vis_pre:
@@ -1138,7 +894,8 @@ class Mask_RCNN_FPN():
 
 			# get rpn anchor labels
 			# [fs_im,fs_im,num_anchor,4]
-						
+			
+				
 			multilevel_anchor_inputs = self.get_multilevel_rpn_anchor_input(resized_image, boxes)
 
 			multilevel_anchor_labels = [l for l,b in multilevel_anchor_inputs]
@@ -1150,21 +907,13 @@ class Mask_RCNN_FPN():
 				feed_dict[pl_labels] = in_labels
 				feed_dict[pl_boxes] = in_boxes
 
+				
+
 			assert len(boxes) > 0
 
 			feed_dict[self.gt_boxes] = boxes
 			feed_dict[self.gt_labels] = labels
 
-			if config.use_small_object_head:
-				for si in xrange(len(config.small_objects)):
-					# the class id in the all classes
-					small_object_class_id = config.classname2id[config.small_objects[si]]
-					# the box ids
-					so_ids = [i for i in xrange(len(labels)) if labels[i] == small_object_class_id]
-					# small object label id is different
-					# so_label is 0/1, so should be all 1s
-					feed_dict[self.so_gt_boxes[si]] = boxes[so_ids, :] # could be empty
-					feed_dict[self.so_gt_labels[si]] = [1 for i in xrange(len(so_ids))]
 		else:
 			
 			pass
@@ -1252,7 +1001,7 @@ class Mask_RCNN_FPN():
 		flatten_anchors_per_level = [k.reshape((-1, 4)) for k in anchors_per_level]
 		all_anchors_flatten = np.concatenate(flatten_anchors_per_level, axis=0)
 		# some image may not be resized to max size, could be shorter edge size
-		inside_ind, inside_anchors = self.filter_box_inside(im, all_anchors_flatten)
+		inside_ind, inside_anchors = self.filter_box_inside(im,all_anchors_flatten)
 		# given all these anchors, given the ground truth box, and their iou to each anchor, get the label to be 1 or 0.
 		anchor_labels, anchor_gt_boxes = self.get_anchor_labels(inside_anchors, boxes)
 
@@ -1344,147 +1093,3 @@ class Mask_RCNN_FPN():
 		anchor_boxes = np.zeros((NA,4),dtype='float32')
 		anchor_boxes[fg_inds,:] = gt_boxes[iou_argmax_per_anchor[fg_inds],:]
 		return anchor_labels, anchor_boxes
-	
-
-#  given the box, just extract feature for each box
-class RCNN_FPN_givenbox():
-	def __init__(self, config, gpuid=0):
-		self.gpuid = gpuid
-		# for batch_norm
-		global is_training
-		is_training = config.is_train # change this before building model
-
-		assert not config.is_train # only for inferencing
-
-		self.config = config
-
-		self.num_class = config.num_class
-
-		self.global_step = tf.get_variable("global_step",shape=[],dtype='int32',initializer=tf.constant_initializer(0),trainable=False)
-
-		# current model get one image at a time
-		self.image = tf.placeholder(tf.float32,[None, None, 3],name="image")
-		# used for dropout switch
-		self.is_train = tf.placeholder("bool",[],name='is_train')
-
-		self.boxes = tf.placeholder(tf.float32,[None, 4],name="boxes")
-
-		# the following will be added in the build_forward and loss
-		self.logits = None
-		self.yp = None
-		self.loss = None
-
-		self.build_preprocess()
-		self.build_forward()
-
-	# get feature map anchor and preprocess image
-	def build_preprocess(self):
-		config = self.config
-		image = self.image
-
-		bgr = True  # cv2 load image is bgr
-		p_image = tf.expand_dims(image,0)  # [1,H,W,C]
-
-		with tf.name_scope("image_preprocess"):  # tf.device("/cpu:0"):
-			if p_image.dtype.base_dtype != tf.float32:
-				p_image = tf.cast(p_image,tf.float32)
-
-			mean = [0.485, 0.456, 0.406]
-			std = [0.229, 0.224, 0.225]
-
-			p_image = p_image*(1.0/255)
-
-			if bgr:
-				mean = mean[::-1]
-				std = std[::-1]
-			image_mean = tf.constant(mean, dtype=tf.float32)
-			image_std = tf.constant(std,dtype=tf.float32)
-			p_image = (p_image - image_mean) / image_std
-			p_image = tf.transpose(p_image,[0, 3, 1, 2])
-
-		self.p_image = p_image
-
-	# based on box sizes
-	def fpn_map_rois_to_levels(self, boxes):
-
-		def tf_area(boxes):
-			x_min, y_min, x_max, y_max = tf.split(boxes, 4, axis=1)
-			return tf.squeeze((y_max - y_min) * (x_max - x_min), [1])
-
-		sqrtarea = tf.sqrt(tf_area(boxes))
-		level = tf.to_int32(tf.floor(4 + tf.log(sqrtarea * (1. / 224) + 1e-6) * (1.0 / np.log(2))))
-		# RoI levels range from 2~5 (not 6)
-		level_ids = [ 
-			tf.where(level <= 2),
-			tf.where(tf.equal(level, 3)),# problems with ==?
-			tf.where(tf.equal(level, 4)),
-			tf.where(level >= 5)]
-
-		level_ids = [tf.reshape(x, [-1], name='roi_level%s_id'%(i + 2)) for i, x in enumerate(level_ids)]
-		num_in_levels = [tf.size(x, name='num_roi_level%s'%(i + 2)) for i, x in enumerate(level_ids)]
-
-		level_boxes = [tf.gather(boxes, ids) for ids in level_ids]
-		return level_ids, level_boxes
-
-	# output_shape is the output feature HxW
-	def multilevel_roi_align(self, features, rcnn_boxes, output_shape):
-		config = self.config
-		assert len(features) == 4
-		# Reassign rcnn_boxes to levels # based on box area size
-		level_ids, level_boxes = self.fpn_map_rois_to_levels(rcnn_boxes)
-		all_rois = []
-
-		# Crop patches from corresponding levels
-		for i, boxes, featuremap in zip(itertools.count(), level_boxes, features):
-			with tf.name_scope('roi_level%s'%(i + 2)):
-				boxes_on_featuremap = boxes * (1.0 / config.anchor_strides[i])
-				all_rois.append(roi_align(featuremap, boxes_on_featuremap, output_shape))
-
-		# this can fail if using TF<=1.8 with MKL build
-		all_rois = tf.concat(all_rois, axis=0)  # NCHW
-		# Unshuffle to the original order, to match the original samples
-		level_id_perm = tf.concat(level_ids, axis=0)  # A permutation of 1~N
-		level_id_invert_perm = tf.invert_permutation(level_id_perm)
-		all_rois = tf.gather(all_rois, level_id_invert_perm)
-		return all_rois
-
-	def build_forward(self):
-		config = self.config
-		image = self.p_image # [1, C, H, W]
-		image_shape2d = tf.shape(image)[2:]
-		# the feature map shared by RPN and fast RCNN
-		# TODO: fix the batch norm mess 
-		# TODO: fix global param like data_format and 
-		# [1,C,FS,FS]
-		
-		c2345 = resnet_fpn_backbone(image, config.resnet_num_block, use_gn=config.use_gn, resolution_requirement=config.fpn_resolution_requirement, use_dilations=config.use_dilations, use_deformable=config.use_deformable, tf_pad_reverse=True, freeze=config.freeze, use_basic_block=config.use_basic_block, use_se=config.use_se)
-		
-		# include lateral 1x1 conv and final 3x3 conv
-		# -> [7, 7, 256]
-		p23456 = fpn_model(c2345, num_channel=config.fpn_num_channel, use_gn=config.use_gn, scope="fpn")
-
-		# here we assume N is not so big that the GPU can handle
-		rcnn_boxes = self.boxes # N, 4
-
-		# NxCx7x7 # (?, 256, 7, 7)
-		roi_feature_fastrcnn = self.multilevel_roi_align(p23456[:4],rcnn_boxes, 7)
-		
-		# [N, 256]
-		self.final_box_features = tf.reduce_mean(roi_feature_fastrcnn, axis=[2, 3])
-			
-
-	# given the image path, and the label for it
-	# preprocess
-	def get_feed_dict(self, im, boxes, is_train=False):
-
-		#{"imgs":[],"gt":[]}
-		config = self.config
-		feed_dict = {}
-		
-		feed_dict[self.image] = im
-		feed_dict[self.boxes] = boxes
-
-		feed_dict[self.is_train] = is_train
-
-		return feed_dict
-	

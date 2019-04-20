@@ -54,6 +54,48 @@ targetClass2id = {
 	"Animal":14,
 	"Articulated_Infrastructure":15,
 }
+
+targetClass2id_new = { 
+	"BG":0,
+	"Vehicle":1,
+	"Person":2,
+	"Parking_Meter":3,
+	"Tree":4,
+	"Skateboard":5,
+	"Prop_Overshoulder":6,
+	"Construction_Barrier":7,
+	"Door":8,
+	"Dumpster":9,
+	"Push_Pulled_Object":10,
+	"Construction_Vehicle":11,
+	"Prop":12,
+	"Bike":13,
+	"Animal":14,
+	# person-object classes
+	"Bike_Person":15,
+	"Prop_Person": 16,
+	"Skateboard_Person": 17,
+	'Prop_Overshoulder_Person': 18
+}
+
+targetClass2id_new_nopo = { 
+	"BG":0,
+	"Vehicle":1,
+	"Person":2,
+	"Parking_Meter":3,
+	"Tree":4,
+	"Skateboard":5,
+	"Prop_Overshoulder":6,
+	"Construction_Barrier":7,
+	"Door":8,
+	"Dumpster":9,
+	"Push_Pulled_Object":10,
+	"Construction_Vehicle":11,
+	"Prop":12,
+	"Bike":13,
+	"Animal":14,
+}
+
 targetClass2id_mergeProp = { 
 	"BG":0,
 	"Vehicle":1,

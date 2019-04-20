@@ -14,7 +14,7 @@ import pycocotools.mask as cocomask
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
-
+from nn import soft_nms,nms
 from generate_anchors import generate_anchors
 
 
@@ -30,13 +30,110 @@ class Summary():
 		with open(path,"w") as f:
 			f.writelines("%s"%("\n".join(self.lines)))
 
-def grouper(l,n):
+def grouper(l,n, fillvalue=None):
 	# given a list and n(batch_size), devide list into n sized chunks
 	# last one will fill None
 	args = [iter(l)]*n
-	out = izip_longest(*args,fillvalue=None)
+	out = izip_longest(*args, fillvalue=fillvalue)
 	out = list(out)
 	return out
+
+# simple FIFO class for moving average computation
+class FIFO_ME:
+	def __init__(self, N):
+		self.N = N
+		self.lst = []
+		assert N > 0
+
+	def put(self, val):
+		if val is None:
+			return None
+		self.lst.append(val)
+		if len(self.lst) > self.N:
+			self.lst.pop(0)
+		return 1
+
+	def me(self):
+		if len(self.lst) == 0:
+			return None
+		return np.mean(self.lst)
+
+# return the gpu utilization at the moment. float between 0~1.0
+# tested for nvidia 384.90
+# gpuid_range is a tuple of (gpu_startid, gpu_num)
+import commands
+def parse_nvidia_smi(gpuid_range):
+	nvi_out = commands.getoutput("nvidia-smi")
+	gpu_info_blocks = get_gpu_info_block(nvi_out)[gpuid_range[0]:gpuid_range[1]+1]
+	num_gpu = len(gpu_info_blocks) # the ones we care
+	# all are a list of 
+	temps = [float(info_block.strip().strip("|").split()[1].strip("C")) for info_block in gpu_info_blocks]
+	utilizations = [float(info_block.strip().strip("|").split()[-2].strip("%"))/100.0 for info_block in gpu_info_blocks]
+	return temps, utilizations
+
+def get_gpu_info_block(nvi_out):
+	nvi_out = nvi_out.split("\n")
+	start_idx = -1
+	end_idx = -1
+	for i, line in enumerate(nvi_out):
+		if line.startswith("|====="):
+			start_idx = i+1
+			break
+	for i, line in enumerate(nvi_out):
+		if line.startswith("     "):
+			end_idx = i
+			break
+	assert (start_idx >= 0) and (end_idx >= 0), nvi_out
+	# each gpu contains two line
+	gpu_info_blocks = []
+	for i in xrange(start_idx, end_idx, 3):
+		# nvi_out[i]:'|   0  GeForce GTX TIT...  Off  | 00000000:01:00.0 Off |                  N/A |'
+		# nvi_out[i+1]: '| 47%   81C    P2    87W / 250W |  10547MiB / 12205MiB |      0%      Default |'
+		gpu_info_blocks.append(nvi_out[i+1])
+	return gpu_info_blocks
+
+def nms_wrapper(final_boxes, final_probs, config):
+	# in this mode, 
+	# final_boxes would be [num_class-1, num_prop, 4]
+	# final_probs would be [num_class-1, num_prop]
+	# 1. make one dets matrix
+	# [num_class-1, num_prop, 5]
+	dets = np.concatenate([final_boxes, np.expand_dims(final_probs, axis=-1)], axis=-1)
+
+	final_boxes, final_probs, final_labels = [],[],[]
+	for c in xrange(dets.shape[0]):  # 0- num_class-1
+		this_dets = dets[c]
+		# hard limit of confident score
+		select_ids = this_dets[:,-1] > config.result_score_thres
+		this_dets = this_dets[select_ids,:]
+
+		classid = c + 1  # first one is BG
+
+		# 2. nms, get [K, 5]
+		#if config.use_soft_nms:
+		#	keep = soft_nms(this_dets)
+		#else:
+		keep = nms(this_dets, config.fastrcnn_nms_iou_thres)
+		this_dets = this_dets[keep, :]
+
+		# sort the output and keep only k for each class
+		boxes = this_dets[:,:4] # [K,4]
+		probs = this_dets[:,4] # [K]
+
+		final_boxes.extend(boxes)
+		final_probs.extend(probs)
+		final_labels.extend([classid for i in xrange(len(probs))])
+
+	final_boxes_all = np.array(final_boxes,dtype="float")
+	final_probs_all = np.array(final_probs)
+	final_labels_all = np.array(final_labels)
+
+	# keep max result across all class
+	ranks = np.argsort(final_probs)[::-1]
+	final_boxes = final_boxes_all[ranks,:][:config.result_per_im]
+	final_probs = final_probs_all[ranks][:config.result_per_im]
+	final_labels = final_labels_all[ranks][:config.result_per_im]
+	return final_boxes, final_labels, final_probs
 
 class Dataset():
 	# data should be 
@@ -145,16 +242,20 @@ def aggregate_eval(e,maxDet=100):
 		dscores = np.concatenate([e_c[imageid]['dscores'][:maxDet] for imageid in e_c])
 		# sort
 		inds = np.argsort(-dscores,kind="mergesort")
-		dscores_sorted = dscores[inds]
+		# dscores_sorted = dscores[inds]
 
 		# put all detection annotation together based on the score sorting
 		dm = np.concatenate([e_c[imageid]['dm'][:maxDet] for imageid in e_c])[inds]
 		num_gt = np.sum([e_c[imageid]['gt_num'] for imageid in e_c])
 
-		aps[catId] = computeAP(dm)
-		ars[catId] = computeAR_2(dm,num_gt)
+		# here the average precision should also put the unmatched ground truth as detection box with lowest score
+		#aps[catId] = computeAP(dm)
+		aps[catId] = computeAP_v2(dm, num_gt)
+		ars[catId] = computeAR_2(dm, num_gt)
+
 	return aps,ars
-def weighted_average(aps,ars,eval_target_weight):
+
+def weighted_average(aps,ars,eval_target_weight=None):
 
 	if eval_target_weight is not None:
 		average_ap = sum([aps[class_]*eval_target_weight[class_] for class_ in aps])
@@ -189,17 +290,14 @@ def match_dt_gt(e, imgid, target_dt_boxes, gt_boxes, eval_target):
 		dscores = [prob for box,prob in target_dt_boxes[target_class]]
 		g = gt_boxes[target_class]
 
+		# len(D), len(G)
 		dm,gm = match_detection(d,g,cocomask.iou(d,g,[0 for _ in xrange(len(g))]),iou_thres=0.5)
 
 		e[target_class][imgid] = {
-			"dscores":[],
-			"dm":[],
+			"dscores":dscores,
+			"dm":dm,
 			"gt_num":len(g),
 		}
-
-		
-		e[target_class][imgid]['dscores'] = dscores
-		e[target_class][imgid]['dm'] = dm
 
 # for activity boxes
 def gather_act_singles(actsingleboxes,actsinglelabels,topk):
@@ -452,6 +550,24 @@ def computeAP(lists):
 			score+=rels/float(rank)
 	if(rels != 0):
 		score/=float(rels)
+	return score
+
+def computeAP_v2(lists, total_gt):
+	
+	#相关的总数
+	rels = 0
+	#当前排名
+	rank = 0
+	#AP 分数
+	score = 0.0
+	for one in lists:
+		rank+=1
+		#是相关的
+		if(one >= 0):
+			rels+=1
+			score+=rels/float(rank)
+	if(total_gt != 0):
+		score/=float(total_gt)
 	return score
 
 # given a fixed number (recall_k) of detection, 

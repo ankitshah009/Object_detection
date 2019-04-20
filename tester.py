@@ -26,12 +26,21 @@ class Tester():
 				self.act_final_labels = [model.act_final_labels for model in models]
 				self.act_final_probs = [model.act_final_probs for model in models]
 
+		self.small_object = False
+		if config.use_small_object_head:
+			self.small_object = True
+		if self.small_object:
+			# infereence out:
+			self.so_final_boxes = [model.so_final_boxes for model in models]
+			# [R]
+			self.so_final_labels = [model.so_final_labels for model in models]
+			self.so_final_probs = [model.so_final_probs for model in models]
+
 		self.add_mask = add_mask
 
 		if add_mask:
 			# [R,14,14]
 			self.final_masks = [model.final_masks for model in models]
-
 
 
 	def step(self,sess,batch):
@@ -52,8 +61,12 @@ class Tester():
 			for _,boxes,labels,probs,masks in zip(range(num_input),self.final_boxes,self.final_labels,self.final_probs,self.final_masks):
 				sess_input+=[boxes,labels,probs,masks]
 		else:	
-			for _,boxes,labels,probs in zip(range(num_input),self.final_boxes,self.final_labels,self.final_probs):
-				sess_input+=[boxes,labels,probs]
+			if self.small_object:
+				for _,boxes,labels,probs,so_boxes, so_labels, so_probs in zip(range(num_input),self.final_boxes,self.final_labels,self.final_probs,self.so_final_boxes,self.so_final_labels,self.so_final_probs):
+					sess_input+=[boxes,labels,probs,so_boxes,so_labels,so_probs]
+			else:
+				for _,boxes,labels,probs in zip(range(num_input),self.final_boxes,self.final_labels,self.final_probs):
+					sess_input+=[boxes,labels,probs]
 
 		if config.add_act:
 			sess_input = []
@@ -71,10 +84,13 @@ class Tester():
 		if self.add_mask:
 			pn = 4
 		else:
-			pn = 3
+			if self.small_object:
+				pn = 6
+			else:
+				pn = 3
 		if config.add_act:
 			if config.act_v2:
-				pn=5
+				pn = 5
 			else:
 				pn = 6
 			outputs = [outputs[i*pn:(i*pn+pn)] for i in xrange(num_input)]
