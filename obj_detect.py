@@ -105,6 +105,8 @@ def get_args():
 
 	assert len(targetClass2id) == args.num_class, (len(targetClass2id), args.num_class)
 
+	# ------- v4, trainval model, 
+	args.use_frcnn_class_agnostic = True
 	# ------- 04/2019 dilated
 	args.use_dilations = True
 
