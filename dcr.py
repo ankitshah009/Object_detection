@@ -8,7 +8,7 @@ from glob import glob
 from utils import Dataset, nms_wrapper, grouper, FIFO_ME
 from dcr_models import get_model, compute_AP
 from dcr_trainer import Trainer
-from dcr_tester import Tester, split_batch_by_box_num, split_data_by_box_num
+from dcr_tester import Tester, split_batch_by_box_num
 from class_ids import targetClass2id_new_nopo
 from models import resizeImage
 from main import initialize, mkdir
@@ -127,8 +127,6 @@ def read_data(config, filelst, annopath, framepath, is_train=False):
 		boxes = anno['frcnn_boxes'] # [K, 4]
 		labels = anno['det_labels'] # [K] # int, 0 is background
 		
-
-
 		assert len(boxes) == len(labels)
 		assert max(labels) < config.num_class
 
@@ -294,25 +292,25 @@ def train(config):
 						for i in xrange(this_batch_num): # num gpu
 							imgid = imgids[i]
 
-							box_logit = outputs[i] # [K, num_class]
+							box_yp = outputs[i] # [K, num_class]
 							
 							val_batch = val_batches[i]
 
 							anno = val_batch.data['gt'][0] # one val_batch is single image
 
-							assert len(anno['boxes']) == len(anno['labels']) == len(box_logit)
+							assert len(anno['boxes']) == len(anno['labels']) == len(box_yp)
 
 							for eval_class in e:
 								classIdx = targetClass2id[eval_class]
 
 								# (K scores, K 1/0 labels)
 								bin_labels = anno['labels'] == classIdx
-								this_logits = box_logit[:, classIdx] # [K]
+								this_yp = box_yp[:, classIdx] # [K]
 								# frcnn is [num_class-1, K]
-								this_logits_mul = this_logits * anno['frcnn_probs'][classIdx-1, :]
+								this_yp_mul = this_yp * anno['frcnn_probs'][classIdx-1, :]
 
-								e[eval_class].extend(zip(this_logits, bin_labels))
-								e_mul[eval_class].extend(zip(this_logits_mul, bin_labels))
+								e[eval_class].extend(zip(this_yp, bin_labels))
+								e_mul[eval_class].extend(zip(this_yp_mul, bin_labels))
 					aps = []
 					aps_mul = []
 					for eval_class in e:
@@ -329,7 +327,7 @@ def train(config):
 					details = "|".join(["%s:%.5f"%(classname, ap) for classname, ap in aps])
 					details_mul = "|".join(["%s:%.5f"%(classname, ap) for classname, ap in aps_mul])
 
-					tqdm.write("\tval in %s at step %s, mean AP:%.5f, details: %s ---- mean AP_mul is %.5f, details: %s. ---- using AP_mul, previous best at %s is %.5f, type: %s"%(num_val_steps, global_step, average_ap, details, average_ap_mul, details_mul, best[1], best[0], best[2]))
+					tqdm.write("\tval in %s at step %s, mean AP:%.5f, details: %s ---- mean AP_mul is %.5f, details: %s. ---- previous best at %s is %.5f, type: %s"%(num_val_steps, global_step, average_ap, details, average_ap_mul, details_mul, best[1], best[0], best[2]))
 
 				if validation_performance > best[0]:
 					tqdm.write("\tsaving best model %s..." % global_step)
@@ -381,15 +379,13 @@ def forward(config):
 	models = []
 	for i in xrange(config.gpuid_start, config.gpuid_start+config.gpu):
 		models.append(get_model(config, i, controller=config.controller))
-	tester = Tester(models,config) # need final box and stuff?
-
-	model_box_logits = [model.yp for model in models]
+	tester = Tester(models, config) 
 
 	tfconfig = tf.ConfigProto(allow_soft_placement=True)
 	if not config.use_all_mem:
 		tfconfig.gpu_options.allow_growth = True # this way it will only allocate nessasary gpu, not take all
 	
-	tfconfig.gpu_options.visible_device_list = "%s"%(",".join(["%s"%i for i in range(config.gpuid_start, config.gpuid_start+config.gpu)])) # so only this gpu will be used
+	tfconfig.gpu_options.visible_device_list = "%s" % (",".join(["%s" % i for i in range(config.gpuid_start, config.gpuid_start+config.gpu)])) # so only this gpu will be used
 
 	with tf.Session(config=tfconfig) as sess:
 
@@ -407,9 +403,11 @@ def forward(config):
 			
 			ori_probs = []
 			ori_frcnn_boxes = []
-			data = []
+			datas = [] # should be a list of Dataset obj
 			ori_box_nums = []
 			for i, filename in enumerate(filenames):
+				data = {"imgs":[], "imgdata":[], "gt":[]}
+
 				videoname = filename.split("_F_")[0]
 				image = os.path.join(config.framepath, videoname, "%s.jpg"%filename)
 				box_npz = os.path.join(config.annopath, "%s.npz"%filename)
@@ -422,43 +420,41 @@ def forward(config):
 				resized_image = resizeImage(im, config.short_edge_size, config.max_size)
 
 				# [K, 4] 
-				boxes = box_data['frcnn_boxes']
-
-				resized_boxes = resize_boxes(boxes, ori_shape[0], ori_shape[1], resized_image.shape[0], resized_image.shape[1])
+				boxes = box_data['frcnn_boxes'].copy()
 				
-				data.append({
-					"image": resized_image, 
-					"boxes": resized_boxes,
+				data['imgs'].append(image)
+				
+				data['gt'].append({
+					"boxes": boxes,
 				})
+				data = Dataset(data, add_gt=True)
+				data.data['imgdata'] = [im]
+				data.data['resized_image'] = [resized_image]
+
+				datas.append(data)
+
 				ori_box_nums.append(len(boxes))
+
 				# [C, K]
 				ori_probs.append(box_data['frcnn_probs'])
-				# [C, K, 4]/ now it is [K, 4]
+				# [K, 4]
 				ori_frcnn_boxes.append(box_data['frcnn_boxes'])
 
-			# num_splited_batch, each is num_gpu data
-			mini_datas = split_data_by_box_num(data, config.test_box_batch_size)
-			outputs = [[] for _ in xrange(this_batch_num)]
+			# data is num_gpu images, but each has multiple boxes,
+			# so split into K jobs, each job is num_gpu images
+			mini_datas = split_batch_by_box_num(([], datas), config.test_box_batch_size)
+			
+			outputs = [[] for _ in xrange(this_batch_num)] # num_gpu
 			for mini_data in mini_datas:
-
-				#sess_input = []
-				#for _, box_logits in zip(range(len(filenames)), model_box_logits):
-				#	sess_input+=[box_logits]
-				#feed_dict = {}
-				#for i in xrange(this_batch_num):
-				#	feed_dict.update(models[i].get_feed_dict_forward(mini_data[i]))
-				#this_outputs = sess.run(sess_input, feed_dict=feed_dict)
-				#pn=1
-				#this_outputs = [this_outputs[i*pn:(i*pn+pn)] for i in xrange(len(filenames))]
 				this_outputs = tester.step(sess, mini_data)
 				for i in xrange(this_batch_num):
-					outputs[i].append(this_outputs[i][0]) # [num_box, num_class] 
+					outputs[i].append(this_outputs[i][0]) # [num_box_test_box_batch_size, num_class]
 
 			# re-assemble boxes
 			for i in xrange(this_batch_num):
 				outputs[i] = np.concatenate(outputs[i], axis=0)[:ori_box_nums[i], :]
 
-			for i, output in enumerate(outputs):
+			for i, output in enumerate(outputs): # num_gpu
 				# [K, num_class]
 				dcr_prob = output
 				dcr_prob = dcr_prob[:, 1:] # [K, C]
@@ -467,11 +463,13 @@ def forward(config):
 
 				C = dcr_prob.shape[0]
 				# [C, K]
+				# only use the dcr model output
 				final_probs = dcr_prob
 				if args.use_mul:
 					ori_prob = ori_probs[i]
 					final_probs = ori_prob * dcr_prob
-				# [C, K, 4]/[K, 4] for class agnostic
+
+				# [K, 4] for class agnostic
 				ori_frcnn_box = ori_frcnn_boxes[i]
 				if len(ori_frcnn_box.shape) == 2:
 					ori_frcnn_box = np.tile(np.expand_dims(ori_frcnn_box, axis=0), [C, 1, 1])

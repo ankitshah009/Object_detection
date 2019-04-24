@@ -47,40 +47,39 @@ class Trainer():
 		learning_rate = config.init_lr
 
 		if config.use_lr_decay:
+			# always use warmup, set step to zero to disable
+			warm_up_start = config.init_lr * 0.33
+			# linear increasing from 0.33*lr to lr in warm_up_steps
+			warm_up_lr = tf.train.polynomial_decay(
+				warm_up_start,
+				self.global_step,
+				config.warm_up_steps,
+				config.init_lr,
+				power=1.0, 
+			)
 						
-			if config.use_cosine_and_warm_up:
-				warm_up_start = config.init_lr * 0.33
-				# linear increasing from 0.33*lr to lr in warm_up_steps
-				warm_up_lr = tf.train.polynomial_decay(
-					warm_up_start,
-					self.global_step,
-					config.warm_up_steps,
-					config.init_lr,
-					power=1.0, 
-				)
-
+			if config.use_cosine_schedule:				
 				max_steps = int(config.train_num_examples / config.im_batch_size * config.num_epochs)
-				cosine_lr = tf.train.cosine_decay(
+				schedule_lr = tf.train.cosine_decay(
 				 	config.init_lr,
 					self.global_step - config.warm_up_steps - config.same_lr_steps,
 					max_steps - config.warm_up_steps - config.same_lr_steps,
 					alpha=0.0
-				)
-
-				boundaries = [config.warm_up_steps, config.warm_up_steps + config.same_lr_steps] # before reaching warm_up steps, use the warm up learning rate.
-				values = [warm_up_lr, config.init_lr, cosine_lr]
-				learning_rate = tf.train.piecewise_constant(self.global_step, boundaries, values)
-				print "learning rate warm up lr from %s to %s in %s steps, then keep for %s steps, then cosine learning rate decay till %s steps" % (warm_up_start, config.init_lr, config.warm_up_steps, config.same_lr_steps, max_steps)
+				)			
 			else:
 				decay_steps = int(config.train_num_examples / config.im_batch_size * config.num_epoch_per_decay)
-				learning_rate = tf.train.exponential_decay(
+				schedule_lr = tf.train.exponential_decay(
 				 	config.init_lr,
 					self.global_step,
 					decay_steps,
 					config.learning_rate_decay,
 					staircase=True
 				)
-				print "learning rate exponential_decay: every %s steps then lr*%s" % (decay_steps, config.learning_rate_decay)
+
+			boundaries = [config.warm_up_steps, config.warm_up_steps + config.same_lr_steps] # before reaching warm_up steps, use the warm up learning rate.
+			values = [warm_up_lr, config.init_lr, schedule_lr]
+			learning_rate = tf.train.piecewise_constant(self.global_step, boundaries, values)
+			print "learning rate warm up lr from %s to %s in %s steps, then keep for %s steps, then schedule learning rate decay" % (warm_up_start, config.init_lr, config.warm_up_steps, config.same_lr_steps)
 
 			self.learning_rate = learning_rate
 		else:

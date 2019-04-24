@@ -13,10 +13,11 @@ class Tester():
 		self.models = models
 		
 		# infereence out:
-		self.final_box_logits = [model.logits for model in models]
+		#self.final_box_logits = [model.logits for model in models]
+		self.final_box_yp = [model.yp for model in models]
 		
 
-	def step(self,sess,batch):
+	def step(self, sess, batch):
 		config = self.config
 		# give one batch of Dataset, use model to get the result,
 		assert isinstance(sess,tf.Session)
@@ -31,8 +32,8 @@ class Tester():
 
 		sess_input = []
 		
-		for _, box_logit in zip(range(num_input), self.final_box_logits):
-			sess_input+=[box_logit] # [K, num_class]
+		for _, box_yp in zip(range(num_input), self.final_box_yp):
+			sess_input+=[box_yp] # [K, num_class]
 
 		outputs = sess.run(sess_input,feed_dict=feed_dict)
 		pn = 1 # number of output per model
@@ -77,35 +78,5 @@ def split_batch_by_box_num(batches, box_batch_size):
 			}
 			this_datas.append(temp)
 		newdata.append((batchIdxs, [Dataset(this_data) for this_data in this_datas]))
-	return newdata
-
-def split_data_by_box_num(data, box_batch_size):
-	newdata = []
-	num_gpu = len(data)
-
-	num_boxes = [data[i]['boxes'].shape[0] for i in xrange(num_gpu)]
-	max_num_box = max(num_boxes)
-
-	split_into_num_batch = int(math.ceil(max_num_box/float(box_batch_size)))
-
-	each_batch_selected_indexes = [grouper(range(num_boxes[i]), box_batch_size, fillvalue=0) for i in xrange(num_gpu)]
-
-	t2 = []
-	for b in each_batch_selected_indexes:
-		if len(b) < split_into_num_batch:
-			need = split_into_num_batch - len(b)
-			b = b + [[0 for _ in xrange(box_batch_size)] for _ in xrange(need)]
-		t2.append(b)
-
-	for i in xrange(split_into_num_batch):
-		this_datas = []
-		for j in xrange(num_gpu):
-			selected = each_batch_selected_indexes[j][i]
-			
-			this_datas.append({
-				"image": data[j]['image'],
-				"boxes": data[j]['boxes'][selected, :],
-			})
-		newdata.append(this_datas)
 	return newdata
 

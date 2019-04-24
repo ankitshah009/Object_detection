@@ -264,7 +264,9 @@ def get_args():
 	parser.add_argument("--learning_rate_decay",default=0.94,type=float,help=("learning rate decay"))
 	#parser.add_argument("--learning_rate_decay_examples",default=1000000,type=int,help=("how many sample to have one decay"))
 	parser.add_argument("--num_epoch_per_decay",default=2.0,type=float,help=("how epoch after which lr decay"))
-	parser.add_argument("--use_cosine_and_warm_up",action="store_true")
+	parser.add_argument("--use_cosine_schedule",action="store_true")
+	parser.add_argument("--use_exp_schedule",action="store_true")
+	
 	parser.add_argument("--warm_up_steps",default=3000,type=int,help=("warm up steps not epochs"))
 	parser.add_argument("--same_lr_steps",default=0,type=int,help=("after warm up, keep the init_lr for k steps"))
 	
@@ -284,8 +286,12 @@ def get_args():
 
 	args = parser.parse_args()
 
-	if args.use_cosine_and_warm_up:
+	if args.use_cosine_schedule:
 		args.use_lr_decay = True
+	if args.use_exp_schedule:
+		args.use_lr_decay = True
+		args.use_cosine_schedule = False
+
 	if args.save_all_box:
 		args.no_nms = True
 

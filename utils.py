@@ -465,7 +465,7 @@ def get_op_tensor_name(name):
 		return name, name + ':0'
 
 # from tensorpack
-def draw_boxes(im, boxes, labels=None, color=None):
+def draw_boxes(im, boxes, labels=None, colors=None):
 	"""
 	Args:
 		im (np.ndarray): a BGR image in range [0,255]. It will not be modified.
@@ -497,7 +497,6 @@ def draw_boxes(im, boxes, labels=None, color=None):
 		"Image shape: {}\n Boxes:\n{}".format(str(im.shape), str(boxes))
 
 	im = im.copy()
-	COLOR = (218, 218, 218) if color is None else color
 	COLOR_DIFF_WEIGHT = np.asarray((3, 4, 2), dtype='int32')	# https://www.wikiwand.com/en/Color_difference
 	COLOR_CANDIDATES = PALETTE_RGB[:, ::-1]
 	if im.ndim == 2 or (im.ndim == 3 and im.shape[2] == 1):
@@ -505,7 +504,7 @@ def draw_boxes(im, boxes, labels=None, color=None):
 	for i in sorted_inds:
 		box = boxes[i, :]
 
-		best_color = COLOR
+		best_color = colors[i] if colors is not None else (255, 0, 0)
 		if labels is not None:
 			label = labels[i]
 
@@ -519,12 +518,7 @@ def draw_boxes(im, boxes, labels=None, color=None):
 			textbox = IntBox(int(top_left[0]), int(top_left[1]),
 							 int(top_left[0] + linew), int(top_left[1] + lineh))
 			textbox.clip_by_shape(im.shape[:2])
-			if color is None:
-				# find the best color
-				mean_color = textbox.roi(im).mean(axis=(0, 1))
-				best_color_ind = (np.square(COLOR_CANDIDATES - mean_color) *
-								  COLOR_DIFF_WEIGHT).sum(axis=1).argmax()
-				best_color = COLOR_CANDIDATES[best_color_ind].tolist()
+
 
 			cv2.putText(im, label, (textbox.x1, textbox.y2),
 						FONT, FONT_SCALE, color=best_color)#, lineType=cv2.LINE_AA)

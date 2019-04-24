@@ -11,6 +11,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("boxpath")
 parser.add_argument("annopath")
 parser.add_argument("newpath")
+parser.add_argument("--iou_thres", type=float, default=0.5, help="iou thres to determine positive and negative, should be 0.5 as we use 0.5 in eval")
 
 if __name__ == "__main__":
 	args = parser.parse_args()
@@ -64,8 +65,9 @@ if __name__ == "__main__":
 		det_max_ious_wrt_gt = np.argmax(ious, axis=1) # [K]
 		det_labels = []
 		all_bg = True
+		# TODO: sample hard false positive? i.e. select the prob higher than 0.3 boxes that has lower gt_iou 0.5
 		for i in xrange(len(det_max_ious_wrt_gt)):
-			if det_max_ious[i] == 0.0: # TODO: set ious?
+			if det_max_ious[i] < args.iou_thres: 
 				cat = 0
 			else:
 				cat = gt_labels[det_max_ious_wrt_gt[i]]
